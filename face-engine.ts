@@ -110,8 +110,19 @@ async function checkPythonServerHealth(): Promise<boolean> {
 
       clearTimeout(timeoutId);
 
+      // Сервер может отвечать 200, но не инициализировать модели (нет buffalo_l) —
+      // тогда детекция молча возвращает пустые кадры. Считаем здоровым только с initialized.
+      let initialized = false;
+      try {
+        const body: any = await response.json();
+        initialized = body?.initialized === true;
+      } catch {
+        initialized = false;
+      }
+      const isHealthy = response.ok && initialized;
+
       const wasHealthy = pythonServerHealthy;
-      pythonServerHealthy = response.ok;
+      pythonServerHealthy = isHealthy;
       pythonServerLastCheck = Date.now();
 
       if (!wasHealthy && pythonServerHealthy) {

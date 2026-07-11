@@ -120,7 +120,21 @@ const storage = multer.diskStorage({
     cb(null, uniqueName);
   },
 });
-const upload = multer({ storage });
+const ALLOWED_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/bmp"]);
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10 МБ
+    files: 50,
+  },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_IMAGE_MIME.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Недопустимый тип файла: ${file.mimetype}`));
+    }
+  },
+});
 
 // ── STATEFUL IN-MEMORY DATABASES ──
 // NOTE: cameras и persons используются как кэш из Prisma (синхронизируются при старте и мутациях).
@@ -182,13 +196,21 @@ let recordingsData: Record<number, Record<string, any[]>> = {};
 
 // ── REST API ROUTES ──
 
+// Убирает секреты (username/password) из объекта камеры перед отдачей клиенту.
+// In-memory массив cameras при этом сохраняет creds для ffmpeg.
+function sanitizeCamera(cam: any): any {
+  if (!cam) return cam;
+  const { username, password, ...safe } = cam;
+  return safe;
+}
+
 // CAMERAS API
 app.get(["/api/cameras", "/api/cameras/"], async (req, res) => {
   try {
     const camsFromDB = await prisma.camera.findMany({ orderBy: { id: "asc" } });
     // Sync in-memory array for WebSocket & FFmpeg use
     cameras = camsFromDB.map((c: any) => ({ ...c, status: c.status || "offline" }));
-    res.json(cameras);
+    res.json(cameras.map(sanitizeCamera));
   } catch (err) {
     logError(err as Error, { path: "/api/cameras", method: "GET" });
     res.status(500).json({ detail: "Internal server error" });
@@ -225,7 +247,7 @@ app.post(["/api/cameras/:id/start", "/api/cameras/:id/start/"], async (req, res)
     });
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) { cameras[index].is_active = true; cameras[index].status = "online"; }
-    res.json({ success: true, status: "online", camera: updated });
+    res.json({ success: true, status: "online", camera: sanitizeCamera(updated) });
   } catch (err) {
     res.status(404).json({ detail: "Camera not found" });
   }
@@ -250,7 +272,7 @@ app.post(["/api/cameras/:id/stop", "/api/cameras/:id/stop/"], async (req, res) =
       cameraStreams.delete(id);
     }
 
-    res.json({ success: true, status: "offline", camera: updated });
+    res.json({ success: true, status: "offline", camera: sanitizeCamera(updated) });
   } catch (err) {
     res.status(404).json({ detail: "Camera not found" });
   }
@@ -609,7 +631,7 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
     });
     // Sync in-memory
     cameras.push({ ...newCam });
-    res.status(201).json(newCam);
+    res.status(201).json(sanitizeCamera(newCam));
   } catch (err) {
     logError(err as Error, { path: "/api/cameras", method: "POST" });
     res.status(500).json({ detail: "Internal server error" });
@@ -628,7 +650,7 @@ app.put("/api/cameras/:id", async (req, res) => {
     // Sync in-memory
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
-    res.json(updated);
+    res.json(sanitizeCamera(updated));
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "PUT" });
     res.status(404).json({ detail: "Camera not found" });
@@ -788,28 +810,28 @@ app.delete(["/api/categories/:code", "/api/categories/:code/"], async (req, res)
 // PERSONS API
 app.get(["/api/persons", "/api/persons/"], async (req, res) => {
   try {
-    const search = (req.query.search as string || "").toLowerCase();
+    const search = (req.query.search as string || "").trim();
     const category = req.query.category as string || "";
-    const sort_by = req.query.sort_by as string || "created_at";
-    const sort_dir = req.query.sort_dir as string || "desc";
+    // Whitelist сортировки — защита от 500-й на произвольном поле из клиента (#11)
+    const ALLOWED_SORT = new Set(["created_at", "name", "visit_count", "category", "last_seen_at", "embedding_count"]);
+    const sort_by = ALLOWED_SORT.has(req.query.sort_by as string) ? (req.query.sort_by as string) : "created_at";
+    const sort_dir: "asc" | "desc" = req.query.sort_dir === "asc" ? "asc" : "desc";
 
-    let personsFromDB = await prisma.person.findMany({
+    const where: any = {};
+    if (category) where.category = category;
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: "insensitive" } },
+        { comment: { contains: search, mode: "insensitive" } },
+        { organization: { contains: search, mode: "insensitive" } },
+      ];
+    }
+
+    const personsFromDB = await prisma.person.findMany({
+      where,
       include: { photos: true },
       orderBy: { [sort_by]: sort_dir }
     });
-
-    if (search) {
-      personsFromDB = personsFromDB.filter(
-        (p: any) =>
-          (p.name || "").toLowerCase().includes(search) ||
-          (p.comment || "").toLowerCase().includes(search) ||
-          (p.organization || "").toLowerCase().includes(search)
-      );
-    }
-
-    if (category) {
-      personsFromDB = personsFromDB.filter((p: any) => p.category === category);
-    }
 
     res.json(personsFromDB);
   } catch (err) {
@@ -2138,7 +2160,19 @@ function buildFfmpegInputArgs(cam: any): string[] {
     }
     return ["-f", "dshow", "-i", `video=${inputSource}`];
   }
-  return ["-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", cam.source];
+  // RTSP / IP / Hikvision / UNV: подставляем сохранённые учётные данные в URL, если их нет в source
+  let source = (cam.source || "").trim();
+  if (cam.username && cam.password && source && !/:\/\/[^@]+@/.test(source)) {
+    try {
+      const u = new URL(source);
+      u.username = encodeURIComponent(cam.username);
+      u.password = encodeURIComponent(cam.password);
+      source = u.toString();
+    } catch {
+      // не URL — оставляем как есть
+    }
+  }
+  return ["-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
 }
 
 // Активные записи видео: cameraId -> сессия
@@ -2167,6 +2201,30 @@ function recordToChronicle(rec: any) {
   if (!recordingsData[rec.camera_id]) recordingsData[rec.camera_id] = {};
   if (!recordingsData[rec.camera_id][dateStr]) recordingsData[rec.camera_id][dateStr] = [];
   recordingsData[rec.camera_id][dateStr].push(entry);
+}
+
+/** Добавляет посетителя в in-memory «Хронику» (вкладка Архив фото). */
+function recordVisitor(cameraId: number, person_id: number | null, person_name: string, snapshot_path: string) {
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19);
+  const filename = path.basename(snapshot_path);
+  let size_kb = 0;
+  try {
+    const stat = fs.statSync(path.join(publicDir, snapshot_path));
+    size_kb = Math.round(stat.size / 1024);
+  } catch { /* ignore */ }
+  const visitor: Visitor = {
+    filename,
+    person_id,
+    person_name,
+    time,
+    photo_url: snapshot_path,
+    size_kb,
+  };
+  if (!chronicleData[cameraId]) chronicleData[cameraId] = {};
+  if (!chronicleData[cameraId][dateStr]) chronicleData[cameraId][dateStr] = [];
+  chronicleData[cameraId][dateStr].unshift(visitor);
 }
 
 /** Запускает запись видео с камеры в файл. durationSec=undefined → непрерывно до stop. */
@@ -2319,6 +2377,7 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
   const confidence = match.similarity;
   const meetsVerification = confidence * 100 >= verification_threshold_pct;
   const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, match.personName);
+  recordVisitor(cam.id, match.personId, match.personName, snapshot_path);
 
   try {
     await prisma.person.update({
@@ -2352,6 +2411,7 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
 
 async function handleUnknownEvent(cam: any, frameBase64: string) {
   const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id);
+  recordVisitor(cam.id, null, "Неизвестный", snapshot_path);
   await persistAndBroadcastEvent({
     cameraId: cam.id,
     cameraName: cam.name,
@@ -2421,6 +2481,10 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
 // Camera feed websocket client storage
 const cameraStreams = new Map<number, Set<WebSocket>>();
 const activeFfmpegProcesses = new Map<number, ChildProcessWithoutNullStreams>();
+// Общий последний кадр + распознанные лица на камеру (читается всеми WS-клиентами этой камеры)
+const cameraFrames = new Map<number, { frame: string; faces: any[] }>();
+// Единый таймер детекции/распознавания на камеру (запускается один раз, а не на каждого клиента)
+const cameraDetectionTimers = new Map<number, NodeJS.Timeout>();
 
 wssCamera.on("connection", (ws, req) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
@@ -2441,148 +2505,36 @@ wssCamera.on("connection", (ws, req) => {
   }
   cameraStreams.get(cameraId)!.add(ws);
 
-  // Cache frame base64 for fallback
-  let fallbackFrame: string;
-  const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
-  const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+  // Кадр-заглушка, если реального потока ещё нет
+  const fallbackFrame = getFallbackFrame();
 
-  if (fs.existsSync(rusSrc)) {
-    fallbackFrame = fs.readFileSync(rusSrc).toString("base64");
-  } else if (fs.existsSync(logoSrc)) {
-    fallbackFrame = fs.readFileSync(logoSrc).toString("base64");
-  } else {
-    fallbackFrame = FALLBACK_JPEG;
-  }
-
-  let currentFrameBase64 = fallbackFrame;
-  let ffmpegProcess: ChildProcessWithoutNullStreams | null = null;
-  let frameBuffer: Buffer[] = [];
-  let headerFound = false;
-
-  const startFfmpeg = (cam: any) => {
-    if (!cam.source) return;
-
-    // Собираем аргументы: общая входная часть + выходной MJPEG-поток в stdout
-    const args = [
-      ...buildFfmpegInputArgs(cam),
-      "-f", "mjpeg",
-      "-pix_fmt", "yuvj422p",
-      "-q:v", "3",
-      "-r", "10",
-      "-s", "640x480",
-      "-"
-    ];
-
-    try {
-      const ffmpegPath = getFfmpegPath();
-      ffmpegProcess = spawn(ffmpegPath, args);
-      activeFfmpegProcesses.set(cameraId, ffmpegProcess);
-      logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name})`, { source: cam.source, path: ffmpegPath });
-
-      ffmpegProcess.stdout.on("data", (chunk: Buffer) => {
-        for (let i = 0; i < chunk.length; i++) {
-          frameBuffer.push(chunk.slice(i, i + 1));
-          const bufferLen = frameBuffer.length;
-
-          // Поиск SOI (Start of Image) 0xFF 0xD8
-          if (!headerFound && bufferLen >= 2) {
-            const b1 = frameBuffer[bufferLen - 2][0];
-            const b2 = frameBuffer[bufferLen - 1][0];
-            if (b1 === 0xFF && b2 === 0xD8) {
-              headerFound = true;
-              frameBuffer = [frameBuffer[bufferLen - 2], frameBuffer[bufferLen - 1]];
-            }
-          }
-          // Поиск EOI (End of Image) 0xFF 0xD9
-          else if (headerFound && bufferLen >= 2) {
-            const b1 = frameBuffer[bufferLen - 2][0];
-            const b2 = frameBuffer[bufferLen - 1][0];
-            if (b1 === 0xFF && b2 === 0xD9) {
-              const fullFrame = Buffer.concat(frameBuffer);
-              currentFrameBase64 = fullFrame.toString("base64");
-              headerFound = false;
-              frameBuffer = [];
-            }
-          }
-        }
-      });
-
-      ffmpegProcess.stderr.on("data", (data) => {
-        // FFmpeg логи в stderr, это нормально
-        logDebug(`FFmpeg (${cam.id}): ${data.toString().trim()}`);
-      });
-
-      ffmpegProcess.on("close", (code) => {
-        logInfo(`FFmpeg завершил работу для камеры ${cam.id}, код: ${code}`);
-        activeFfmpegProcesses.delete(cameraId);
-        // Попробуем перезапустить через 3 сек
-        setTimeout(() => {
-          const currentCam = cameras.find(c => c.id === cameraId);
-          if (currentCam && currentCam.is_active && !activeFfmpegProcesses.has(cameraId)) {
-            startFfmpeg(currentCam);
-          }
-        }, 3000);
-      });
-
-      ffmpegProcess.on("error", (err) => {
-        logError(`Ошибка FFmpeg для камеры ${cam.id}: ${err.message}`);
-      });
-    } catch (e: any) {
-      logError(`Не удалось запустить FFmpeg: ${e.message}`);
-    }
-  };
-
-  // Запускаем FFmpeg если это первый клиент для этой камеры
+  // Запускаем FFmpeg + детекцию, если это первый клиент для этой камеры
   if (!activeFfmpegProcesses.has(cameraId)) {
-    startFfmpeg(initialCam);
+    startCameraPipeline(initialCam, fallbackFrame);
   }
 
-  // Переменные для детекции лиц
-  let lastDetectionTime = 0;
-  let lastDetectedFaces: any[] = [];
-  let detectionInProgress = false;
-
-  // Интервал для отправки кадров клиентам
-  const intervalId = setInterval(async () => {
+  // Отправляем клиенту общий кадр камеры (обновляется единым конвейером)
+  const intervalId = setInterval(() => {
     if (ws.readyState !== WebSocket.OPEN) {
       clearInterval(intervalId);
       return;
     }
-
     const currentCam = cameras.find(c => c.id === cameraId);
     if (!currentCam || !currentCam.is_active) {
       ws.close();
       clearInterval(intervalId);
       return;
     }
-
-    // Запускаем детекцию лиц каждые 500 мс
-    const now = Date.now();
-    if (now - lastDetectionTime > 500 && !detectionInProgress && currentFrameBase64) {
-      detectionInProgress = true;
-      try {
-        // Конвертируем base64 в буфер
-        const frameBuffer = Buffer.from(currentFrameBase64, 'base64');
-        // Используем наш face-engine для детекции
-        const faces = await detectFaces(frameBuffer);
-        // Распознавание + (debounced) события в БД + обогащение кадра
-        lastDetectedFaces = await processDetectedFaces(currentCam, currentFrameBase64, faces);
-        lastDetectionTime = now;
-      } catch (e) {
-        // Если детекция не удалась, оставляем старые лица
-        logError(e as Error, { cameraId });
-      }
-      detectionInProgress = false;
-    }
-
-    // Отправляем текущий кадр и последние найденные лица
+    const shared = cameraFrames.get(cameraId);
+    const frame = shared ? shared.frame : fallbackFrame;
+    const faces = shared ? shared.faces : [];
     ws.send(
       JSON.stringify({
         type: "FRAME",
         camera_id: cameraId,
         timestamp: Date.now(),
-        frame: currentFrameBase64,
-        faces: lastDetectedFaces,
+        frame,
+        faces,
       })
     );
   }, 100);
@@ -2598,17 +2550,144 @@ wssCamera.on("connection", (ws, req) => {
     const streams = cameraStreams.get(cameraId);
     if (streams) {
       streams.delete(ws);
-      // Если больше нет клиентов - останавливаем FFmpeg
+      // Если больше нет клиентов — останавливаем FFmpeg и цикл детекции
       if (streams.size === 0) {
-        const proc = activeFfmpegProcesses.get(cameraId);
-        if (proc) {
-          proc.kill("SIGKILL");
-          activeFfmpegProcesses.delete(cameraId);
-        }
+        stopCameraPipeline(cameraId);
       }
     }
   });
 });
+
+// ── Общий конвейер камеры: один FFmpeg + один цикл детекции на всех клиентов ──
+const SOI = Buffer.from([0xFF, 0xD8]);
+const EOI = Buffer.from([0xFF, 0xD9]);
+
+function getFallbackFrame(): string {
+  const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
+  const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+  if (fs.existsSync(rusSrc)) return fs.readFileSync(rusSrc).toString("base64");
+  if (fs.existsSync(logoSrc)) return fs.readFileSync(logoSrc).toString("base64");
+  return FALLBACK_JPEG;
+}
+
+function startCameraPipeline(cam: any, fallbackFrame: string) {
+  if (!cam.source) return;
+
+  const args = [
+    ...buildFfmpegInputArgs(cam),
+    "-f", "mjpeg",
+    "-pix_fmt", "yuvj422p",
+    "-q:v", "3",
+    "-r", "10",
+    "-s", "640x480",
+    "-"
+  ];
+
+  try {
+    const ffmpegPath = getFfmpegPath();
+    const proc = spawn(ffmpegPath, args);
+    activeFfmpegProcesses.set(cam.id, proc);
+    logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name})`, { source: cam.source, path: ffmpegPath });
+
+    // Эффективный разбор MJPEG: один растущий буфер + indexOf (без побайтовых аллокаций)
+    let acc = Buffer.alloc(0);
+    let headerFound = false;
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      acc = acc.length ? Buffer.concat([acc, chunk]) : chunk;
+
+      // Ограничиваем размер буфера, чтобы не съесть память при сбоях потока
+      if (acc.length > 8 * 1024 * 1024) acc = acc.slice(acc.length - 64);
+
+      while (true) {
+        if (!headerFound) {
+          const s = acc.indexOf(SOI);
+          if (s < 0) {
+            // SOI ещё не пришёл — оставляем хвост (макс. 4 байта на случай разрыва SOI между чанками)
+            acc = acc.length > 4 ? acc.slice(acc.length - 4) : acc;
+            break;
+          }
+          acc = acc.slice(s); // отбрасываем мусор до начала кадра
+          headerFound = true;
+        }
+        const e = acc.indexOf(EOI, 1);
+        if (e < 0) {
+          // Кадр ещё не закончился — ждём следующий чанк
+          break;
+        }
+        const jpeg = acc.slice(0, e + 2);
+        const shared = cameraFrames.get(cam.id) || { frame: fallbackFrame, faces: [] };
+        shared.frame = jpeg.toString("base64");
+        cameraFrames.set(cam.id, shared);
+        acc = acc.slice(e + 2);
+        headerFound = false;
+      }
+    });
+
+    proc.stderr.on("data", (d) => logDebug(`FFmpeg (${cam.id}): ${d.toString().trim()}`));
+
+    proc.on("error", (err) => logError(`Ошибка FFmpeg для камеры ${cam.id}: ${err.message}`));
+
+    proc.on("close", (code) => {
+      logInfo(`FFmpeg завершил работу для камеры ${cam.id}, код: ${code}`);
+      activeFfmpegProcesses.delete(cam.id);
+      cameraFrames.delete(cam.id);
+      // Попробуем перезапустить через 3 сек
+      setTimeout(() => {
+        const currentCam = cameras.find(c => c.id === cam.id);
+        if (currentCam && currentCam.is_active && !activeFfmpegProcesses.has(cam.id)) {
+          startCameraPipeline(currentCam, fallbackFrame);
+        }
+      }, 3000);
+    });
+
+    startCameraDetection(cam, fallbackFrame);
+  } catch (e: any) {
+    logError(`Не удалось запустить FFmpeg: ${e.message}`);
+  }
+}
+
+function startCameraDetection(cam: any, fallbackFrame: string) {
+  if (cameraDetectionTimers.has(cam.id)) return;
+  let detectionInProgress = false;
+
+  const timer = setInterval(async () => {
+    if (!activeFfmpegProcesses.has(cam.id)) return;
+    const shared = cameraFrames.get(cam.id);
+    const frameBase64 = shared ? shared.frame : fallbackFrame;
+    if (!frameBase64 || frameBase64 === fallbackFrame) return; // реального кадра ещё нет
+    if (detectionInProgress) return;
+
+    detectionInProgress = true;
+    try {
+      const buf = Buffer.from(frameBase64, "base64");
+      const faces = await detectFaces(buf);
+      const enriched = await processDetectedFaces(cam, frameBase64, faces);
+      const cur = cameraFrames.get(cam.id) || { frame: frameBase64, faces: [] };
+      cur.faces = enriched;
+      cameraFrames.set(cam.id, cur);
+    } catch (e) {
+      logError(e as Error, { cameraId: cam.id });
+    }
+    detectionInProgress = false;
+  }, 500);
+
+  cameraDetectionTimers.set(cam.id, timer);
+}
+
+function stopCameraPipeline(cameraId: number) {
+  const proc = activeFfmpegProcesses.get(cameraId);
+  if (proc) {
+    try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    activeFfmpegProcesses.delete(cameraId);
+  }
+  const timer = cameraDetectionTimers.get(cameraId);
+  if (timer) {
+    clearInterval(timer);
+    cameraDetectionTimers.delete(cameraId);
+  }
+  cameraFrames.delete(cameraId);
+}
 
 // Upgrade handling for websockets
 server.on("upgrade", (request, socket, head) => {
