@@ -22,6 +22,25 @@ venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 ```
 
+Для продакшена рекомендуется минимальный набор:
+```bash
+pip install faiss-cpu insightface opencv-python-headless fastapi uvicorn python-multipart
+```
+
+### 2.1. Настройка переменных окружения AI-сервера
+
+Скопируйте `.env.example` в `.env` и проверьте значения:
+
+| Переменная               | По умолчанию                    | Описание                                    |
+|--------------------------|---------------------------------|---------------------------------------------|
+| `FACE_API_KEY`           | `super-secret-change-me`        | Ключ для защиты `/update-index`             |
+| `FACE_FRAME_SKIP`        | `2`                             | Пропуск кадров (1 = каждый кадр)            |
+| `FACE_MIN_FACE_SIZE`     | `60`                            | Мин. ширина лица в пикселях                 |
+| `FACE_MIN_DET_SCORE`     | `0.8`                           | Мин. уверенность детекции InsightFace       |
+| `FACE_COOLDOWN_SECONDS`  | `30`                            | Кулдаун повторного срабатывания             |
+| `FACE_RECOGNITION_THRESHOLD` | `55`                        | Порог распознавания в процентах (0-100)     |
+| `DB_PATH`                | `prisma/dev.db`                 | Путь к SQLite для авто-загрузки FAISS       |
+
 ### 3. Настройка базы данных
 
 ```bash
@@ -44,12 +63,22 @@ npm run dev
 
 Скопируйте `.env.example` в `.env` и проверьте значения:
 
-| Переменная        | По умолчанию              | Описание                        |
-|-------------------|---------------------------|---------------------------------|
-| `PORT`            | `3000`                    | Порт Node.js сервера            |
-| `FACE_SERVER_URL` | `http://localhost:8001`   | URL Python Face Engine          |
-| `DATABASE_URL`    | `file:./dev.db`           | Путь к SQLite базе              |
-| `NODE_ENV`        | `development`             | Режим запуска                   |
+| Переменная               | По умолчанию                    | Описание                                    |
+|--------------------------|---------------------------------|---------------------------------------------|
+| `PORT`                   | `3000`                          | Порт Node.js сервера                        |
+| `HOST`                   | `0.0.0.0`                       | Сетевой интерфейс привязки                  |
+| `API_KEY`                | —                               | API-ключ для `/api` и `/ws` (опционально)   |
+| `VITE_API_KEY`           | —                               | API-ключ для клиента (должен совпадать)     |
+| `FACE_SERVER_URL`        | `http://localhost:8001`         | URL Python Face Engine                      |
+| `FACE_API_KEY`           | `super-secret-change-me`        | Ключ для защиты `/update-index`             |
+| `FACE_FRAME_SKIP`        | `2`                             | Пропуск кадров (1 = каждый кадр)            |
+| `FACE_MIN_FACE_SIZE`     | `60`                            | Мин. ширина лица в пикселях                 |
+| `FACE_MIN_DET_SCORE`     | `0.8`                           | Мин. уверенность детекции InsightFace       |
+| `FACE_COOLDOWN_SECONDS`  | `30`                            | Кулдаун повторного срабатывания             |
+| `FACE_RECOGNITION_THRESHOLD` | `55`                        | Порог распознавания в процентах (0-100)     |
+| `DB_PATH`                | `prisma/dev.db`                 | Путь к SQLite для авто-загрузки FAISS       |
+| `DATABASE_URL`           | `file:./dev.db?journal_mode=WAL` | Путь к SQLite базе с WAL-режимом         |
+| `NODE_ENV`               | `development`                   | Режим запуска                               |
 
 ---
 
