@@ -634,7 +634,7 @@ async function detectFacesFromServer(
 
 async function recognizeDescriptorOnServer(
   descriptor: Float32Array,
-  options: { category?: string; topK?: number } = {}
+  options: { category?: string; topK?: number; threshold?: number } = {}
 ): Promise<RecognitionMatch[]> {
   try {
     const payload = {
@@ -645,6 +645,9 @@ async function recognizeDescriptorOnServer(
     const url = new URL(`${FACE_SERVER_URL}/recognize-by-descriptor`);
     url.searchParams.set("top_k", String(options.topK || 5));
     url.searchParams.set("apply_cooldown", "true");
+    if (options.threshold !== undefined && options.threshold !== null) {
+      url.searchParams.set("threshold", String(options.threshold));
+    }
 
     const response = await fetch(url.toString(), {
       method: "POST",
@@ -921,9 +924,10 @@ export async function searchByPhoto(
     const matches = await recognizeDescriptorOnServer(descriptor, {
       category: options.category,
       topK: maxResults,
+      threshold,
     });
 
-    return matches.filter((m) => m.similarity > threshold).slice(0, maxResults);
+    return matches.slice(0, maxResults);
   } catch (err) {
     logError(err as Error, { context: "Поиск по фото" });
     return [];
@@ -946,9 +950,10 @@ export async function searchByDescriptor(
   const matches = await recognizeDescriptorOnServer(descriptor, {
     category: options.category,
     topK: maxResults,
+    threshold,
   });
 
-  return matches.filter((m) => m.similarity > threshold).slice(0, maxResults);
+  return matches.slice(0, maxResults);
 }
 
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {

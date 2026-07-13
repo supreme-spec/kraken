@@ -10,8 +10,6 @@ import os
 import io
 import json
 import logging
-import sqlite3
-import base64
 import time
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +29,7 @@ FRAME_SKIP: int = int(os.getenv("FACE_FRAME_SKIP", "2"))
 MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "60"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.8"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
-RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.35"))
+RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.55"))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -154,72 +152,6 @@ try:
 except Exception as e:
     logger.error(f"Startup initialization error: {e}")
     is_initialized = False
-
-
-# ─── SQLite Auto-Load ─────────────────────────────────────────────────────────
-
-def load_descriptors_from_sqlite(db_path: str = "prisma/dev.db") -> List[Dict[str, Any]]:
-    """Loads descriptors directly from SQLite for auto-indexing on startup."""
-    if not os.path.exists(db_path):
-        logger.warning(f"SQLite DB not found at {db_path}, skipping auto-index.")
-        return []
-
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT fd.person_id, p.name as person_name, p.category, fd.photo_path, fd.descriptor
-            FROM FaceDescriptor fd
-            JOIN Person p ON p.id = fd.person_id
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-
-        descriptors: List[Dict[str, Any]] = []
-        for row in rows:
-            desc_raw = row["descriptor"]
-            if isinstance(desc_raw, bytes):
-                desc_raw = desc_raw.decode("utf-8")
-
-            desc_list: List[float] = []
-            if isinstance(desc_raw, str):
-                if desc_raw.strip().startswith("["):
-                    desc_list = json.loads(desc_raw)
-                else:
-                    try:
-                        decoded = base64.b64decode(desc_raw)
-                        desc_list = np.frombuffer(decoded, dtype=np.float32).tolist()
-                    except Exception:
-                        desc_list = []
-
-            if not desc_list:
-                continue
-
-            descriptors.append({
-                "person_id": row["person_id"],
-                "person_name": row["person_name"],
-                "category": row["category"] or "",
-                "photo_path": row["photo_path"] or "",
-                "descriptor": desc_list,
-            })
-
-        logger.info(f"Loaded {len(descriptors)} descriptors from SQLite for FAISS index.")
-        return descriptors
-    except Exception as e:
-        logger.error(f"Failed to load descriptors from SQLite: {e}")
-        return []
-
-
-if is_initialized:
-    try:
-        initial_descriptors = load_descriptors_from_sqlite()
-        if initial_descriptors:
-            _build_faiss_index(initial_descriptors)
-        else:
-            logger.info("No descriptors found in DB. FAISS index is empty.")
-    except Exception as e:
-        logger.error(f"Auto-index build failed: {e}")
 
 
 # ─── FAISS Helpers ────────────────────────────────────────────────────────────
@@ -476,6 +408,7 @@ async def recognize(
     image: UploadFile = File(...),
     top_k: Optional[int] = 5,
     category: Optional[str] = "",
+    threshold: Optional[float] = None,
     apply_cooldown: Optional[bool] = True,
 ):
     """
@@ -514,6 +447,7 @@ async def recognize(
 
         embedding = np.array(primary_face.embedding, dtype=np.float32)
         candidates = get_faiss_matches(embedding, top_k=top_k)
+        effective_threshold = threshold if threshold is not None else RECOGNITION_THRESHOLD
 
         matches: List[Dict[str, Any]] = []
         for candidate in candidates:
@@ -523,7 +457,7 @@ async def recognize(
             if category and person.get("category") != category:
                 continue
 
-            if sim < RECOGNITION_THRESHOLD:
+            if sim < effective_threshold:
                 continue
 
             person_id = person["person_id"]
@@ -559,6 +493,7 @@ async def recognize_by_descriptor(
     payload: Dict[str, Any],
     top_k: Optional[int] = 5,
     category: Optional[str] = "",
+    threshold: Optional[float] = None,
     apply_cooldown: Optional[bool] = True,
 ):
     """
@@ -579,6 +514,7 @@ async def recognize_by_descriptor(
             raise HTTPException(status_code=400, detail="Empty descriptor")
 
         candidates = get_faiss_matches(embedding, top_k=top_k)
+        effective_threshold = threshold if threshold is not None else RECOGNITION_THRESHOLD
 
         matches: List[Dict[str, Any]] = []
         for candidate in candidates:
@@ -588,7 +524,7 @@ async def recognize_by_descriptor(
             if category and person.get("category") != category:
                 continue
 
-            if sim < RECOGNITION_THRESHOLD:
+            if sim < effective_threshold:
                 continue
 
             person_id = person["person_id"]

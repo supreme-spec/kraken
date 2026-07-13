@@ -190,7 +190,7 @@ const DEFAULT_TAG_TYPES = {
 
 // ── SETTINGS STATE (синхронизируются с БД через Settings table) ──
 let active_categories: string[] = ["BLACKLIST", "RESPONSE", "VIP"];
-let recognition_threshold_pct = 30;
+let recognition_threshold_pct = 55;
 let verification_threshold_pct = 60;
 let embedding_cache_enabled = true;
 let embedding_cache_ttl_days = 30;
@@ -896,6 +896,9 @@ app.delete(["/api/persons/by_category/:category", "/api/persons/by_category/:cat
       where: { category }
     });
 
+    // Sync in-memory
+    persons = persons.filter((p) => p.category !== category);
+
     res.json({ ok: true, deleted: deleted.count });
   } catch (err) {
     logError(err as Error, { path: "/api/persons/by_category/:category", method: "DELETE" });
@@ -1043,6 +1046,9 @@ app.delete(["/api/persons/:id", "/api/persons/:id/"], async (req, res) => {
 
     // Удаляем персону
     await prisma.person.delete({ where: { id } });
+
+    // Sync in-memory
+    persons = persons.filter((p) => p.id !== id);
 
     res.json({ success: true });
   } catch (err) {
@@ -2581,8 +2587,9 @@ const SOI = Buffer.from([0xFF, 0xD8]);
 const EOI = Buffer.from([0xFF, 0xD9]);
 
 function getFallbackFrame(): string {
-  const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
-  const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+  const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
+  const rusSrc = path.join(assetsDir, "rus.jpg");
+  const logoSrc = path.join(assetsDir, "logo.jpg");
   if (fs.existsSync(rusSrc)) return fs.readFileSync(rusSrc).toString("base64");
   if (fs.existsSync(logoSrc)) return fs.readFileSync(logoSrc).toString("base64");
   return FALLBACK_JPEG;
