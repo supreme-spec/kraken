@@ -18,7 +18,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import LiveVideo from '../components/LiveVideo'
 import CategoryBadge from '../components/CategoryBadge'
 import type { FaceDetection, AlertMessage, Camera, KrakenEvent, Person } from '../types'
-import { apiFetch, PHOTO_BASE, WS_BASE } from '../api/client'
+import { apiFetch, PHOTO_BASE, wsUrl } from '../api/client'
 // ── Парсим URL параметры ──────────────────────────────────────────────────────
 function parseParams() {
   const p = new URLSearchParams(window.location.search)
@@ -92,7 +92,7 @@ export default function ScreenProjection() {
   // WebSocket для алертов + обновление событий
   useEffect(() => {
     const connect = () => {
-      const ws = new WebSocket(`${WS_BASE}/ws/security`)
+      const ws = new WebSocket(wsUrl("/ws/security"))
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)

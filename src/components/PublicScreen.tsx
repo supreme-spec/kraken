@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { WS_BASE } from '../api/client'
+import { wsUrl } from '../api/client'
 
 interface Props {
   cameraId: number | null
@@ -13,7 +13,7 @@ export default function PublicScreen({ cameraId }: Props) {
   useEffect(() => {
     if (!cameraId) return
 
-    const ws = new WebSocket(`${WS_BASE}/ws/camera/${cameraId}`)
+    const ws = new WebSocket(wsUrl(`/ws/camera/${cameraId}`))
 
     ws.onopen = () => setConnected(true)
     ws.onclose = () => setConnected(false)

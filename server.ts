@@ -39,7 +39,14 @@ if (!process.env.NODE_ENV) {
 
 const app = express();
 const server = http.createServer(app);
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
+// Привязка: по умолчанию 0.0.0.0 (доступно в локальной сети для камер/операторов).
+// Для чисто локального use-case задайте HOST=127.0.0.1. БЕЗОПАСНОСТЬ: при публикации порта
+// обязательно задайте API_KEY, иначе API и WS будут открыты для сети.
+const HOST = process.env.HOST || "0.0.0.0";
+// Опциональный API-ключ. Если задан — сервер требует его на всех /api и /ws.
+// Если не задан — сервер работает открыто (dev), но выводит предупреждение.
+const API_KEY = process.env.API_KEY || "";
 
 app.use(express.json());
 
@@ -47,14 +54,25 @@ app.use(express.json());
 app.use((req, res, next) => {
   const start = Date.now();
   logInfo(`${req.method} ${req.url}`, { ip: req.ip });
-  
+
   res.on("finish", () => {
     const duration = Date.now() - start;
     logInfo(`${req.method} ${req.url} ${res.statusCode}`, { duration: `${duration}ms` });
   });
-  
+
   next();
 });
+
+// API-key аутентификация (включается только если задан API_KEY в .env)
+function apiKeyAuth(req: any, res: any, next: any) {
+  if (!API_KEY) return next();
+  const auth = req.headers["authorization"] || "";
+  const headerKey = req.headers["x-api-key"];
+  const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (token === API_KEY || headerKey === API_KEY) return next();
+  return res.status(401).json({ detail: "Unauthorized: требуется API_KEY" });
+}
+app.use("/api", apiKeyAuth);
 
 // ── ENSURE DIRECTORIES & ASSETS EXIST ──
 const FALLBACK_JPEG = "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
@@ -2440,7 +2458,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
 
     let match: any = null;
     if (desc && desc.length) {
-      const matches = searchByDescriptor(desc, threshold, 1);
+      const matches = await searchByDescriptor(desc, threshold, 1);
       if (matches.length) match = matches[0];
     }
 
@@ -2691,8 +2709,22 @@ function stopCameraPipeline(cameraId: number) {
 
 // Upgrade handling for websockets
 server.on("upgrade", (request, socket, head) => {
-  const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
+  const url = new URL(request.url || "", `http://${request.headers.host}`);
+  const pathname = url.pathname;
   logInfo(`WebSocket upgrade request: ${pathname}`);
+
+  // API-key защита WS (если задан API_KEY)
+  if (API_KEY) {
+    const qk = url.searchParams.get("api_key");
+    const hk = request.headers["x-api-key"] as string | undefined;
+    const auth = request.headers["authorization"] as string | undefined;
+    const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (qk !== API_KEY && hk !== API_KEY && token !== API_KEY) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{\"detail\":\"Unauthorized: требуется api_key\"}");
+      socket.destroy();
+      return;
+    }
+  }
 
   if (pathname === "/ws/security") {
     wssSecurity.handleUpgrade(request, socket, head, (ws) => {
@@ -3118,8 +3150,15 @@ async function start() {
     });
   }
 
-  server.listen(PORT, "0.0.0.0", () => {
-    logInfo(`Server running on http://localhost:${PORT}`);
+  if (!API_KEY) {
+    logWarn("SECURITY: API_KEY не задан — API и WebSocket доступны в сети БЕЗ аутентификации. " +
+      "Задайте API_KEY в .env (и VITE_API_KEY на клиенте) перед публикацией/доступом извне.");
+  } else {
+    logInfo("API-key аутентификация ВКЛЮЧЕНА (требуется на всех /api и /ws).");
+  }
+
+  server.listen(PORT, HOST, () => {
+    logInfo(`Server running on http://${HOST}:${PORT}`);
   });
 }
 

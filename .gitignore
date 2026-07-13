@@ -22,3 +22,8 @@ prisma/*.db-journal
 # ML model weights (fetch later via download_models.py / download_buffalo_l.py)
 models/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+

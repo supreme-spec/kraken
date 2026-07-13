@@ -17,6 +17,18 @@ export const API_ORIGIN = ''
 export const WS_BASE =
   `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
 
+// API-ключ (опционален). Если на сервере задан API_KEY — клиент обязан его передавать.
+const API_KEY = (import.meta.env.VITE_API_KEY as string | undefined) || ''
+function getApiKey(): string {
+  return API_KEY || localStorage.getItem('kraken_token') || ''
+}
+
+/** Строит URL для WebSocket с api_key в query (браузер не может задать произвольный заголовок). */
+export function wsUrl(path: string): string {
+  const k = getApiKey()
+  return k ? `${WS_BASE}${path}?api_key=${encodeURIComponent(k)}` : `${WS_BASE}${path}`
+}
+
 /**
  * Normalize API path: add trailing slash only for simple collection endpoints.
  *
@@ -47,7 +59,7 @@ function normalizePath(path: string): string {
 }
 
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const token = localStorage.getItem('kraken_token')
+  const token = getApiKey()
   const url = `${BASE_URL}${normalizePath(path)}`
   const method = options?.method || 'GET'
 
@@ -81,7 +93,7 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
 }
 
 export async function apiUpload<T>(path: string, formData: FormData): Promise<T> {
-  const token = localStorage.getItem('kraken_token')
+  const token = getApiKey()
   const url = `${BASE_URL}${normalizePath(path)}`
 
   clientLogger.debug(`API загрузка: POST ${path}`)

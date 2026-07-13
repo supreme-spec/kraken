@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Trash2, RefreshCw } from 'lucide-react'
 import type { KrakenEvent } from '../types'
-import { apiFetch, PHOTO_BASE, WS_BASE } from '../api/client'
+import { apiFetch, PHOTO_BASE, wsUrl } from '../api/client'
 import CategoryBadge from '../components/CategoryBadge'
 import ConfirmModal from '../components/ConfirmModal'
 
@@ -66,7 +66,7 @@ export default function Events() {
 
   // WebSocket — мгновенное обновление при новых событиях
   useEffect(() => {
-    const ws = new WebSocket(`${WS_BASE}/ws/security`)
+    const ws = new WebSocket(wsUrl("/ws/security"))
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data)

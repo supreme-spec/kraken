@@ -17,7 +17,7 @@ import Categories from './pages/Categories'
 import Requirements from './pages/Requirements'
 import type { Camera, KrakenEvent, AlertMessage, FaceDetection } from './types'
 import { apiFetch } from './api/client'
-import { WS_BASE } from './api/client'
+import { wsUrl } from './api/client'
 import { usePushNotifications } from './hooks/usePushNotifications'
 import { playAlertSound, loadSoundConfigs, initAudio, type SoundCategory } from './hooks/useAlertSounds'
 import clientLogger from './lib/client-logger'
@@ -117,7 +117,7 @@ export default function App() {
   // Security WebSocket for alerts + event refresh
   useEffect(() => {
     const connect = () => {
-      const ws = new WebSocket(`${WS_BASE}/ws/security`)
+      const ws = new WebSocket(wsUrl("/ws/security"))
       wsRef.current = ws
 
       ws.onmessage = (e) => {

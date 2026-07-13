@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Plus, Search, Edit2, Trash2, Upload, X, Camera, RefreshCw, ImagePlus, Star, Phone, Mail, MapPin, Building2, Calendar, Eye, AlertTriangle, ThumbsUp, ScanFace, ArrowUpDown, FolderOpen, CheckSquare, Square, Layers, Settings, ChevronDown } from 'lucide-react'
 import type { Person, Category, Camera as CameraType } from '../types'
-import { apiFetch, apiUpload, WS_BASE, PHOTO_BASE } from '../api/client'
+import { apiFetch, apiUpload, wsUrl, PHOTO_BASE } from '../api/client'
 import CategoryBadge from '../components/CategoryBadge'
 import { useCategories } from '../hooks/useCategories'
 import ConfirmModal, { AlertModal } from '../components/ConfirmModal'
@@ -957,7 +957,7 @@ function CameraPreview({ cameraId }: { cameraId: number }) {
 
   useEffect(() => {
     if (!cameraId) return
-    const ws = new WebSocket(`${WS_BASE}/ws/camera/${cameraId}`)
+    const ws = new WebSocket(wsUrl(`/ws/camera/${cameraId}`))
     wsRef.current = ws
     ws.onopen = () => setConnected(true)
     ws.onclose = () => setConnected(false)

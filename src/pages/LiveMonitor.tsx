@@ -13,7 +13,7 @@ import CategoryBadge from '../components/CategoryBadge'
 import RoiEditor from '../components/RoiEditor'
 import { useDragResize, type Rect } from '../hooks/useDragResize'
 import type { FaceDetection, KrakenEvent, Person, Category, Camera } from '../types'
-import { apiFetch, apiUpload, PHOTO_BASE, WS_BASE } from '../api/client'
+import { apiFetch, apiUpload, PHOTO_BASE, wsUrl } from '../api/client'
 import { Search, Plus, Edit2, Trash2, X, Upload, ScanLine, LayoutGrid, Eye, EyeOff, RotateCcw, Camera as CameraIcon, RefreshCw, ImagePlus, Save, FolderOpen, WifiOff } from 'lucide-react'
 import ConfirmModal, { AlertModal } from '../components/ConfirmModal'
 
@@ -981,7 +981,7 @@ function LiveCameraPreview({ cameraId }: { cameraId: number }) {
   const decodingRef = useRef(false)
 
   useEffect(() => {
-    const ws = new WebSocket(`${WS_BASE}/ws/camera/${cameraId}`)
+    const ws = new WebSocket(wsUrl(`/ws/camera/${cameraId}`))
     ws.onopen = () => setConnected(true)
     ws.onclose = () => setConnected(false)
     let lastFrameTime = 0

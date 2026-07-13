@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FaceDetection } from '../types'
-import { WS_BASE } from '../api/client'
+import { wsUrl } from '../api/client'
 
 interface Props {
   cameraId: number | null
@@ -279,7 +279,7 @@ export default function LiveVideo({ cameraId, onFaceDetected, onFrameReceived }:
       setStreamState('connecting')
       scheduleConnectTimeout()
 
-      const ws = new WebSocket(`${WS_BASE}/ws/camera/${cameraId}`)
+      const ws = new WebSocket(wsUrl(`/ws/camera/${cameraId}`))
       ws.binaryType = 'arraybuffer'
       currentWs = ws
 

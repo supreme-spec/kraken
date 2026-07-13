@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Face Detection & Recognition Server (FastAPI + InsightFace)
-Современная реализация для системы безопасности
-С кроссплатформенным GPU-ускорением и безопасным fallback на CPU
+Face Detection & Recognition Server (FastAPI + InsightFace + FAISS)
+Production-ready implementation for high-load security systems.
+Optimized for 10,000+ persons with FAISS exact search (IndexFlatIP).
 """
 
 import asyncio
@@ -10,26 +10,42 @@ import os
 import io
 import json
 import logging
-import numpy as np
-from typing import Dict, List, Optional, Tuple
+import sqlite3
+import base64
+import time
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 import cv2
+import numpy as np
+import faiss
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='[FaceEngine] %(levelname)s: %(message)s')
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+FRAME_SKIP: int = int(os.getenv("FACE_FRAME_SKIP", "2"))
+MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "60"))
+MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.8"))
+COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
+RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.35"))
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(level=logging.INFO, format="[FaceEngine] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Убедимся, что папка для моделей существует
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# Инициализация FastAPI
-app = FastAPI(title="Smart Security - Face Engine", version="3.0.0")
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Smart Security - Face Engine", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -38,53 +54,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Глобальные переменные для моделей
+# ─── Global State ─────────────────────────────────────────────────────────────
+
 face_app = None
 is_initialized = False
 used_provider = "CPUExecutionProvider"
 
+faiss_index: Optional[faiss.IndexFlatIP] = None
+faiss_index_id_to_person: List[Dict[str, Any]] = []
+faiss_lock = threading.Lock()
 
-def get_optimal_providers():
-    """
-    Определяет лучшее GPU-ускорение для текущего железа (NVIDIA, AMD, Intel).
-    """
+last_recognition_time: Dict[str, float] = {}
+cooldown_lock = threading.Lock()
+
+_frame_counter = 0
+frame_lock = threading.Lock()
+
+
+# ─── GPU Provider Selection ───────────────────────────────────────────────────
+
+def get_optimal_providers() -> List[str]:
+    """Determines best available GPU acceleration."""
     import onnxruntime as ort
     available_providers = ort.get_available_providers()
-    providers = []
+    providers: List[str] = []
 
-    # 1. NVIDIA (CUDA) - самый мощный и стабильный
-    if 'CUDAExecutionProvider' in available_providers:
-        providers.append('CUDAExecutionProvider')
-        logger.info("Обнаружен NVIDIA GPU. Используем CUDA.")
-
-    # 2. AMD / Intel (DirectML) - отлично работает на Windows
-    elif 'DmlExecutionProvider' in available_providers:
-        providers.append('DmlExecutionProvider')
-        logger.info("Обнаружен AMD/Intel GPU. Используем DirectML.")
-
-    # 3. Intel (OpenVINO) - специфично для Linux и CPU Intel
-    elif 'OpenVINOExecutionProvider' in available_providers:
-        providers.append('OpenVINOExecutionProvider')
-        logger.info("Обнаружен Intel GPU/CPU. Используем OpenVINO.")
-
-    # 4. AMD (ROCm) - специфично для Linux
-    elif 'ROCMExecutionProvider' in available_providers:
-        providers.append('ROCMExecutionProvider')
-        logger.info("Обнаружен AMD GPU. Используем ROCm.")
-
+    if "CUDAExecutionProvider" in available_providers:
+        providers.append("CUDAExecutionProvider")
+        logger.info("NVIDIA GPU detected. Using CUDA.")
+    elif "DmlExecutionProvider" in available_providers:
+        providers.append("DmlExecutionProvider")
+        logger.info("AMD/Intel GPU detected. Using DirectML.")
+    elif "OpenVINOExecutionProvider" in available_providers:
+        providers.append("OpenVINOExecutionProvider")
+        logger.info("Intel GPU/CPU detected. Using OpenVINO.")
+    elif "ROCMExecutionProvider" in available_providers:
+        providers.append("ROCMExecutionProvider")
+        logger.info("AMD GPU detected. Using ROCm.")
     else:
-        logger.warning("GPU-провайдеры не найдены. Будет использован только CPU.")
+        logger.warning("No GPU providers found. Falling back to CPU.")
 
-    # CPU всегда идет последним как fallback
-    providers.append('CPUExecutionProvider')
+    providers.append("CPUExecutionProvider")
     return providers
 
 
-def initialize_face_engine():
-    """
-    Инициализирует InsightFace с умным fallback:
-    если GPU не смог загрузить модель, переключаемся на CPU.
-    """
+# ─── InsightFace Initialization ───────────────────────────────────────────────
+
+def initialize_face_engine() -> Tuple[Any, str]:
+    """Initializes InsightFace with smart fallback."""
     used_provider_local = "CPUExecutionProvider"
     try:
         import insightface
@@ -92,114 +109,292 @@ def initialize_face_engine():
         target_providers = get_optimal_providers()
         ort.set_default_logger_severity(3)
 
-        # Если в списке только CPU, сразу инициализируем
-        if target_providers == ['CPUExecutionProvider']:
-            logger.info("Инициализация InsightFace на CPU...")
-            app_instance = insightface.app.FaceAnalysis(name='buffalo_l', root=str(MODELS_DIR),
-                                                   providers=['CPUExecutionProvider'])
+        if target_providers == ["CPUExecutionProvider"]:
+            logger.info("Initializing InsightFace on CPU...")
+            app_instance = insightface.app.FaceAnalysis(
+                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+            )
             app_instance.prepare(ctx_id=-1, det_size=(640, 640))
-            used_provider_local = "CPUExecutionProvider"
-            logger.info("InsightFace успешно загружен на CPU!")
-            return app_instance, used_provider_local
+            logger.info("InsightFace loaded on CPU.")
+            return app_instance, "CPUExecutionProvider"
 
-        # Пытаемся инициализировать на GPU
         try:
-            logger.info(f"Попытка инициализации InsightFace на GPU с провайдерами: {target_providers[:-1]}...")
-            # Создаем приложение
-            app_instance = insightface.app.FaceAnalysis(name='buffalo_l', root=str(MODELS_DIR), providers=target_providers)
-            # prepare() реально загружает модели в память
+            logger.info(f"Attempting GPU initialization with: {target_providers[:-1]}")
+            app_instance = insightface.app.FaceAnalysis(
+                name="buffalo_l", root=str(MODELS_DIR), providers=target_providers
+            )
             app_instance.prepare(ctx_id=0, det_size=(640, 640))
             used_provider_local = target_providers[0]
-            logger.info("InsightFace успешно загружен на GPU!")
+            logger.info(f"InsightFace loaded on {used_provider_local}.")
             return app_instance, used_provider_local
         except Exception as e:
-            logger.error(f"Критическая ошибка инициализации GPU: {e}")
-            logger.warning("Выполняется экстренный откат (fallback) на CPU...")
-            # Fallback на чистый CPU
-            app_instance = insightface.app.FaceAnalysis(name='buffalo_l', root=str(MODELS_DIR), providers=['CPUExecutionProvider'])
+            logger.error(f"GPU initialization failed: {e}")
+            logger.warning("Falling back to CPU...")
+            app_instance = insightface.app.FaceAnalysis(
+                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+            )
             app_instance.prepare(ctx_id=-1, det_size=(640, 640))
-            used_provider_local = "CPUExecutionProvider"
-            logger.info("InsightFace загружен на CPU (режим совместимости).")
-            return app_instance, used_provider_local
+            logger.info("InsightFace loaded on CPU (compatibility mode).")
+            return app_instance, "CPUExecutionProvider"
 
     except Exception as e:
-        logger.error(f"Общая ошибка инициализации: {e}")
+        logger.error(f"Fatal initialization error: {e}")
         import traceback
         traceback.print_exc()
-        logger.error("Работаем в режиме демо (без AI)")
+        logger.error("Running in demo mode (no AI).")
         return None, "none"
 
 
-# Глобальная инициализация при старте сервера
+# ─── Startup ──────────────────────────────────────────────────────────────────
+
 try:
     face_app, used_provider = initialize_face_engine()
     if face_app is not None:
         is_initialized = True
 except Exception as e:
-    logger.error(f"Ошибка инициализации: {e}")
+    logger.error(f"Startup initialization error: {e}")
     is_initialized = False
 
 
-# --- Типы для ответов ---
-class FaceDetection:
-    def __init__(self, box: List[int], score: float, descriptor: Optional[List[float]] = None):
-        self.box = {"x": box[0], "y": box[1], "width": box[2] - box[0], "height": box[3] - box[1]}
-        self.score = float(score)
-        self.descriptor = descriptor
+# ─── SQLite Auto-Load ─────────────────────────────────────────────────────────
+
+def load_descriptors_from_sqlite(db_path: str = "prisma/dev.db") -> List[Dict[str, Any]]:
+    """Loads descriptors directly from SQLite for auto-indexing on startup."""
+    if not os.path.exists(db_path):
+        logger.warning(f"SQLite DB not found at {db_path}, skipping auto-index.")
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT fd.person_id, p.name as person_name, p.category, fd.photo_path, fd.descriptor
+            FROM FaceDescriptor fd
+            JOIN Person p ON p.id = fd.person_id
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        descriptors: List[Dict[str, Any]] = []
+        for row in rows:
+            desc_raw = row["descriptor"]
+            if isinstance(desc_raw, bytes):
+                desc_raw = desc_raw.decode("utf-8")
+
+            desc_list: List[float] = []
+            if isinstance(desc_raw, str):
+                if desc_raw.strip().startswith("["):
+                    desc_list = json.loads(desc_raw)
+                else:
+                    try:
+                        decoded = base64.b64decode(desc_raw)
+                        desc_list = np.frombuffer(decoded, dtype=np.float32).tolist()
+                    except Exception:
+                        desc_list = []
+
+            if not desc_list:
+                continue
+
+            descriptors.append({
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+                "category": row["category"] or "",
+                "photo_path": row["photo_path"] or "",
+                "descriptor": desc_list,
+            })
+
+        logger.info(f"Loaded {len(descriptors)} descriptors from SQLite for FAISS index.")
+        return descriptors
+    except Exception as e:
+        logger.error(f"Failed to load descriptors from SQLite: {e}")
+        return []
 
 
-class RecognitionMatch:
-    def __init__(self, person_id: int, person_name: str, category: str, similarity: float, photo_path: str):
-        self.person_id = person_id
-        self.person_name = person_name
-        self.category = category
-        self.similarity = float(similarity)
-        self.photo_path = photo_path
+if is_initialized:
+    try:
+        initial_descriptors = load_descriptors_from_sqlite()
+        if initial_descriptors:
+            _build_faiss_index(initial_descriptors)
+        else:
+            logger.info("No descriptors found in DB. FAISS index is empty.")
+    except Exception as e:
+        logger.error(f"Auto-index build failed: {e}")
 
 
-# --- API endpoints ---
-@app.get("/status")
-async def get_status():
-    """Получить статус AI движка"""
-    return {
-        "initialized": is_initialized,
-        "backend": "insightface" if is_initialized else "demo",
-        "provider": used_provider
-    }
+# ─── FAISS Helpers ────────────────────────────────────────────────────────────
+
+def _build_faiss_index(descriptors: List[Dict[str, Any]]) -> None:
+    """Rebuilds FAISS index from normalized descriptors."""
+    global faiss_index, faiss_index_id_to_person
+
+    if not descriptors:
+        faiss_index = None
+        faiss_index_id_to_person = []
+        logger.info("FAISS index cleared (no descriptors).")
+        return
+
+    dim = 512
+    matrix = np.zeros((len(descriptors), dim), dtype=np.float32)
+    for i, item in enumerate(descriptors):
+        arr = np.array(item["descriptor"], dtype=np.float32)
+        norm = np.linalg.norm(arr)
+        if norm > 1e-12:
+            arr = arr / norm
+        matrix[i] = arr
+
+    with faiss_lock:
+        index = faiss.IndexFlatIP(dim)
+        index.add(matrix)
+        faiss_index = index
+        faiss_index_id_to_person = [
+            {
+                "person_id": item["person_id"],
+                "person_name": item["person_name"],
+                "category": item.get("category", ""),
+                "photo_path": item.get("photo_path", ""),
+            }
+            for item in descriptors
+        ]
+
+    logger.info(f"FAISS index built: {index.ntotal} vectors, dim={dim}.")
 
 
-@app.get("/health")
-async def get_health():
-    """Health check endpoint"""
-    return {
-        "status": "ok",
-        "initialized": is_initialized
-    }
+def get_faiss_matches(query_vector: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Searches FAISS and returns mapped person data."""
+    if faiss_index is None or faiss_index.ntotal == 0:
+        return []
 
+    query = np.array(query_vector, dtype=np.float32).reshape(1, -1)
+    norm = np.linalg.norm(query)
+    if norm > 1e-12:
+        query = query / norm
+
+    with faiss_lock:
+        scores, indices = faiss_index.search(query, min(top_k, faiss_index.ntotal))
+
+    results: List[Dict[str, Any]] = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx == -1:
+            continue
+        if idx >= len(faiss_index_id_to_person):
+            continue
+        results.append({
+            "score": float(score),
+            "person": faiss_index_id_to_person[idx],
+        })
+    return results
+
+
+# ─── Image Helpers ────────────────────────────────────────────────────────────
 
 def load_image_from_bytes(data: bytes) -> Optional[np.ndarray]:
-    """Загрузить изображение из байтов"""
+    """Decodes image bytes to RGB numpy array."""
     if not data:
         return None
     try:
         img = Image.open(io.BytesIO(data))
         img_rgb = np.array(img.convert("RGB"))
     except Exception as e:
-        logger.error(f"Не удалось декодировать изображение: {e}")
+        logger.error(f"Image decode failed: {e}")
         return None
     if img_rgb.size == 0:
         return None
     return img_rgb
 
 
+# ─── Quality Gate ─────────────────────────────────────────────────────────────
+
+def passes_quality_gate(face: Any) -> bool:
+    """
+    Filters low-quality detections before embedding extraction.
+    Rejects:
+      - det_score < MIN_DETECTION_SCORE
+      - face width < MIN_FACE_SIZE
+    """
+    score = float(face.det_score) if hasattr(face, "det_score") else 0.0
+    if score < MIN_DETECTION_SCORE:
+        logger.debug(f"Quality gate: score {score:.3f} < {MIN_DETECTION_SCORE}")
+        return False
+
+    bbox = face.bbox.astype(int).tolist()
+    width = int(bbox[2] - bbox[0])
+    if width < MIN_FACE_SIZE:
+        logger.debug(f"Quality gate: width {width} < {MIN_FACE_SIZE}")
+        return False
+
+    return True
+
+
+# ─── Cooldown / Debounce ──────────────────────────────────────────────────────
+
+def get_cooldown_key(person_id: Any, category: str = "") -> str:
+    return f"{category}:{person_id}"
+
+
+def is_on_cooldown(person_id: Any, category: str = "") -> bool:
+    """Returns True if person was recognized recently."""
+    key = get_cooldown_key(person_id, category)
+    now = time.time()
+    with cooldown_lock:
+        last_time = last_recognition_time.get(key, 0.0)
+        if now - last_time < COOLDOWN_SECONDS:
+            logger.debug(f"Cooldown active for {key} ({now - last_time:.1f}s < {COOLDOWN_SECONDS}s)")
+            return True
+        last_recognition_time[key] = now
+    return False
+
+
+# ─── Frame Skipping ───────────────────────────────────────────────────────────
+
+def should_process_frame() -> bool:
+    """
+    Frame skipping logic.
+    Processes only every N-th frame to reduce inference load by 50-66%.
+    """
+    global _frame_counter
+    with frame_lock:
+        _frame_counter += 1
+        if FRAME_SKIP <= 1:
+            return True
+        return _frame_counter % FRAME_SKIP == 0
+
+
+# ─── API Endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/status")
+async def get_status() -> Dict[str, Any]:
+    """Returns AI engine status."""
+    return {
+        "initialized": is_initialized,
+        "backend": "insightface" if is_initialized else "demo",
+        "provider": used_provider,
+        "faiss_vectors": faiss_index.ntotal if faiss_index is not None else 0,
+        "frame_skip": FRAME_SKIP,
+        "min_det_score": MIN_DETECTION_SCORE,
+        "min_face_size": MIN_FACE_SIZE,
+        "cooldown_seconds": COOLDOWN_SECONDS,
+        "recognition_threshold": RECOGNITION_THRESHOLD,
+    }
+
+
+@app.get("/health")
+async def get_health() -> Dict[str, Any]:
+    """Health check endpoint."""
+    return {
+        "status": "ok",
+        "initialized": is_initialized,
+    }
+
+
 @app.post("/detect-faces")
 async def detect_faces(
     image: UploadFile = File(...),
     max_faces: Optional[int] = 20,
-    min_confidence: Optional[float] = 0.5,
-    with_descriptors: Optional[bool] = False
+    min_confidence: Optional[float] = None,
+    with_descriptors: Optional[bool] = False,
 ):
-    """Детекция лиц на изображении"""
+    """Detects faces on image. Applies quality gate."""
     try:
         image_bytes = await image.read()
         img = load_image_from_bytes(image_bytes)
@@ -210,19 +405,25 @@ async def detect_faces(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
+        threshold = min_confidence if min_confidence is not None else MIN_DETECTION_SCORE
         faces = face_app.get(img)
-        results = []
+        results: List[Dict[str, Any]] = []
 
-        for i, face in enumerate(faces[:max_faces]):
-            if face.det_score < min_confidence:
+        for face in faces[:max_faces]:
+            if not passes_quality_gate(face):
                 continue
 
             box = face.bbox.astype(int).tolist()
-            detection = {
-                "box": {"x": box[0], "y": box[1], "width": box[2] - box[0], "height": box[3] - box[1]},
-                "score": float(face.det_score)
+            detection: Dict[str, Any] = {
+                "box": {
+                    "x": box[0],
+                    "y": box[1],
+                    "width": box[2] - box[0],
+                    "height": box[3] - box[1],
+                },
+                "score": float(face.det_score),
             }
-            if with_descriptors and hasattr(face, 'embedding') and face.embedding is not None:
+            if with_descriptors and hasattr(face, "embedding") and face.embedding is not None:
                 detection["descriptor"] = face.embedding.tolist()
             results.append(detection)
 
@@ -230,7 +431,7 @@ async def detect_faces(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Ошибка детекции: {e}")
+        logger.error(f"Detection error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -238,7 +439,7 @@ async def detect_faces(
 
 @app.post("/get-embedding")
 async def get_embedding(image: UploadFile = File(...)):
-    """Получить эмбеддинг лица из изображения"""
+    """Extracts face embedding from image. Applies quality gate."""
     try:
         image_bytes = await image.read()
         img = load_image_from_bytes(image_bytes)
@@ -250,17 +451,206 @@ async def get_embedding(image: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
         faces = face_app.get(img)
-        if len(faces) == 0:
+        if not faces:
             return {"descriptor": None, "error": "No face detected"}
 
-        if not hasattr(faces[0], 'embedding') or faces[0].embedding is None:
+        face = faces[0]
+        if not passes_quality_gate(face):
+            return {"descriptor": None, "error": "Low quality face"}
+
+        if not hasattr(face, "embedding") or face.embedding is None:
             return {"descriptor": None, "error": "Failed to extract embedding"}
 
-        return {"descriptor": faces[0].embedding.tolist()}
+        return {"descriptor": face.embedding.tolist()}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Ошибка эмбеддинга: {e}")
+        logger.error(f"Embedding error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recognize")
+async def recognize(
+    image: UploadFile = File(...),
+    top_k: Optional[int] = 5,
+    category: Optional[str] = "",
+    apply_cooldown: Optional[bool] = True,
+):
+    """
+    Full recognition pipeline:
+      1. Frame skip check (stateless, but demonstrates pattern)
+      2. Detect faces with quality gate
+      3. Extract embedding
+      4. FAISS search
+      5. Cooldown / debounce
+      6. Return best match or 'unknown'
+    """
+    try:
+        image_bytes = await image.read()
+        img = load_image_from_bytes(image_bytes)
+
+        if not is_initialized or face_app is None:
+            return {"matches": [], "status": "demo"}
+
+        if img is None or img.size == 0:
+            raise HTTPException(status_code=400, detail="Empty or invalid image")
+
+        if not should_process_frame():
+            return {"matches": [], "status": "skipped"}
+
+        faces = face_app.get(img)
+        if not faces:
+            return {"matches": [], "status": "no_faces"}
+
+        valid_faces = [f for f in faces if passes_quality_gate(f)]
+        if not valid_faces:
+            return {"matches": [], "status": "no_valid_faces"}
+
+        primary_face = valid_faces[0]
+        if not hasattr(primary_face, "embedding") or primary_face.embedding is None:
+            return {"matches": [], "status": "no_embedding"}
+
+        embedding = np.array(primary_face.embedding, dtype=np.float32)
+        candidates = get_faiss_matches(embedding, top_k=top_k)
+
+        matches: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            person = candidate["person"]
+            sim = float(candidate["score"])
+
+            if category and person.get("category") != category:
+                continue
+
+            if sim < RECOGNITION_THRESHOLD:
+                continue
+
+            person_id = person["person_id"]
+            if apply_cooldown and is_on_cooldown(person_id, person.get("category", "")):
+                continue
+
+            matches.append({
+                "person_id": person_id,
+                "person_name": person["person_name"],
+                "category": person.get("category", ""),
+                "photo_path": person.get("photo_path", ""),
+                "similarity": sim,
+            })
+
+        matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return {
+            "matches": matches[:top_k],
+            "status": "ok",
+            "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Recognition error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recognize-by-descriptor")
+async def recognize_by_descriptor(
+    payload: Dict[str, Any],
+    top_k: Optional[int] = 5,
+    category: Optional[str] = "",
+    apply_cooldown: Optional[bool] = True,
+):
+    """
+    Recognition by precomputed descriptor (no re-detection).
+    Expected JSON body:
+    {
+      "descriptor": [float, float, ...],
+      "person_label": "optional_label_for_cooldown"
+    }
+    """
+    try:
+        descriptor_raw = payload.get("descriptor")
+        if not descriptor_raw:
+            raise HTTPException(status_code=400, detail="Missing descriptor")
+
+        embedding = np.array(descriptor_raw, dtype=np.float32)
+        if embedding.size == 0:
+            raise HTTPException(status_code=400, detail="Empty descriptor")
+
+        candidates = get_faiss_matches(embedding, top_k=top_k)
+
+        matches: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            person = candidate["person"]
+            sim = float(candidate["score"])
+
+            if category and person.get("category") != category:
+                continue
+
+            if sim < RECOGNITION_THRESHOLD:
+                continue
+
+            person_id = person["person_id"]
+            if apply_cooldown and is_on_cooldown(person_id, person.get("category", "")):
+                continue
+
+            matches.append({
+                "person_id": person_id,
+                "person_name": person["person_name"],
+                "category": person.get("category", ""),
+                "photo_path": person.get("photo_path", ""),
+                "similarity": sim,
+            })
+
+        matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return {
+            "matches": matches[:top_k],
+            "status": "ok",
+            "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Descriptor recognition error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/update-index")
+async def update_index(payload: Dict[str, Any]):
+    """
+    Rebuilds FAISS index from provided persons data.
+    Expected payload:
+    {
+      "persons": [
+        {
+          "person_id": 1,
+          "person_name": "John Doe",
+          "category": "STAFF",
+          "photo_path": "/photos/1.jpg",
+          "descriptor": [float, float, ...]  // 512-d
+        },
+        ...
+      ]
+    }
+    """
+    try:
+        persons = payload.get("persons", [])
+        if not persons:
+            _build_faiss_index([])
+            return {"status": "ok", "indexed": 0}
+
+        _build_faiss_index(persons)
+        return {
+            "status": "ok",
+            "indexed": len(persons),
+            "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
+        }
+    except Exception as e:
+        logger.error(f"Index update error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -271,20 +661,23 @@ async def compare_faces(
     descriptor1: UploadFile = File(...),
     descriptor2: UploadFile = File(...)
 ):
-    """Сравнить два эмбеддинга"""
+    """Compares two embeddings using normalized dot product."""
     try:
-        d1 = np.array(json.loads((await descriptor1.read()).decode()))
-        d2 = np.array(json.loads((await descriptor2.read()).decode()))
+        d1 = np.array(json.loads((await descriptor1.read()).decode()), dtype=np.float32)
+        d2 = np.array(json.loads((await descriptor2.read()).decode()), dtype=np.float32)
 
-        # Косинусное сходство
-        similarity = np.dot(d1, d2) / (np.linalg.norm(d1) * np.linalg.norm(d2))
-        return {"similarity": float(similarity)}
+        d1 = d1 / (np.linalg.norm(d1) + 1e-12)
+        d2 = d2 / (np.linalg.norm(d2) + 1e-12)
+        similarity = float(np.dot(d1, d2))
+        return {"similarity": similarity}
     except Exception as e:
-        logger.error(f"Ошибка сравнения: {e}")
+        logger.error(f"Comparison error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

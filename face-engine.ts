@@ -632,6 +632,81 @@ async function detectFacesFromServer(
   }
 }
 
+async function recognizeDescriptorOnServer(
+  descriptor: Float32Array,
+  options: { category?: string; topK?: number } = {}
+): Promise<RecognitionMatch[]> {
+  try {
+    const payload = {
+      descriptor: Array.from(descriptor),
+      category: options.category || "",
+    };
+
+    const url = new URL(`${FACE_SERVER_URL}/recognize-by-descriptor`);
+    url.searchParams.set("top_k", String(options.topK || 5));
+    url.searchParams.set("apply_cooldown", "true");
+
+    const response = await fetch(url.toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      logWarn(`Python recognition failed: ${response.status}`);
+      return [];
+    }
+
+    const result = await response.json() as {
+      matches: Array<{
+        person_id: number;
+        person_name: string;
+        category: string;
+        photo_path: string;
+        similarity: number;
+      }>;
+    };
+
+    return result.matches.map((m) => ({
+      personId: m.person_id,
+      personName: m.person_name,
+      category: m.category,
+      photoPath: m.photo_path,
+      similarity: m.similarity,
+    }));
+  } catch (e) {
+    logError(e as Error, { context: "Распознавание дескриптора на Python" });
+    return [];
+  }
+}
+
+async function syncIndexWithPython(): Promise<void> {
+  try {
+    const persons = storedDescriptors.map((d) => ({
+      person_id: d.personId,
+      person_name: d.personName,
+      category: d.category,
+      photo_path: d.photoPath,
+      descriptor: Array.from(d.descriptor),
+    }));
+
+    const response = await fetch(`${FACE_SERVER_URL}/update-index`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ persons }),
+    });
+
+    if (!response.ok) {
+      logWarn(`Python index sync failed: ${response.status}`);
+    } else {
+      const result = await response.json() as { indexed?: number };
+      logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
+    }
+  } catch (e) {
+    logError(e as Error, { context: "Синхронизация индекса с Python" });
+  }
+}
+
 // ─── ОСНОВНЫЕ ФУНКЦИИ ────────────────────────────────────────────────────────
 
 export async function detectFaces(
@@ -753,6 +828,9 @@ export async function registerPerson(
     await saveDescriptorToDB(personId, personName, category, photoPath, descriptor);
 
     logDebug(`Зарегистрирован дескриптор для "${personName}" (ID: ${personId})`);
+
+    await syncIndexWithPython();
+
     return { success: true, hasEmbedding: true };
   } catch (err) {
     logError(err as Error, { context: "Регистрация", personId, personName });
@@ -776,6 +854,8 @@ export async function unregisterPerson(personId: number): Promise<void> {
     logError(err as Error, { context: "Удаление из БД", personId });
   }
   logDebug(`Удалено ${before - storedDescriptors.length} дескрипторов персоны ID: ${personId}`);
+
+  await syncIndexWithPython();
 }
 
 /**
@@ -838,26 +918,12 @@ export async function searchByPhoto(
       return [];
     }
 
-    // Partitioning: если указана категория — ищем только в ней
-    const candidates = options.category
-      ? getDescriptorsByCategory(options.category)
-      : storedDescriptors;
+    const matches = await recognizeDescriptorOnServer(descriptor, {
+      category: options.category,
+      topK: maxResults,
+    });
 
-    const matches: RecognitionMatch[] = [];
-    for (const stored of candidates) {
-      const similarity = cosineSimilarity(descriptor, stored.descriptor);
-      if (similarity > threshold) {
-        matches.push({
-          personId: stored.personId,
-          personName: stored.personName,
-          category: stored.category,
-          similarity,
-          photoPath: stored.photoPath,
-        });
-      }
-    }
-    matches.sort((a, b) => b.similarity - a.similarity);
-    return matches.slice(0, maxResults);
+    return matches.filter((m) => m.similarity > threshold).slice(0, maxResults);
   } catch (err) {
     logError(err as Error, { context: "Поиск по фото" });
     return [];
@@ -865,36 +931,24 @@ export async function searchByPhoto(
 }
 
 /**
- * Ищет совпадение по уже вычисленному эмбеддингу, БЕЗ обращения к Python-серверу.
- * Используется в реальном времени: detectFaces уже возвращает descriptor для каждого лица,
- * поэтому повторный запрос эмбеддинга не нужен.
+ * Ищет совпадение по уже вычисленному эмбеддингу.
+ * При 10 000+ персон поиск выполняется на Python-сервере через FAISS.
  */
-export function searchByDescriptor(
+export async function searchByDescriptor(
   descriptor: Float32Array | null | undefined,
   threshold: number = 0.4,
   maxResults: number = 5,
   options: { category?: string } = {}
-): RecognitionMatch[] {
+): Promise<RecognitionMatch[]> {
   if (!descriptor || descriptor.length === 0) return [];
   if (!isInitialized) return [];
 
-  const candidates = options.category ? getDescriptorsByCategory(options.category) : storedDescriptors;
+  const matches = await recognizeDescriptorOnServer(descriptor, {
+    category: options.category,
+    topK: maxResults,
+  });
 
-  const matches: RecognitionMatch[] = [];
-  for (const stored of candidates) {
-    const similarity = cosineSimilarity(descriptor, stored.descriptor);
-    if (similarity > threshold) {
-      matches.push({
-        personId: stored.personId,
-        personName: stored.personName,
-        category: stored.category,
-        similarity,
-        photoPath: stored.photoPath,
-      });
-    }
-  }
-  matches.sort((a, b) => b.similarity - a.similarity);
-  return matches.slice(0, maxResults);
+  return matches.filter((m) => m.similarity > threshold).slice(0, maxResults);
 }
 
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
@@ -910,7 +964,8 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
 }
 
 export async function rebuildDescriptorIndex(persons: any[]): Promise<{ registered: number; failed: number }> {
-  logInfo("Перестроение индекса не требуется (дескрипторы загружаются из БД)");
+  logInfo("Перестроение FAISS индекса...");
+  await syncIndexWithPython();
   return { registered: storedDescriptors.length, failed: 0 };
 }
 
