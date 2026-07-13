@@ -27,6 +27,16 @@ pip install -r requirements.txt
 pip install faiss-cpu insightface opencv-python-headless fastapi uvicorn python-multipart
 ```
 
+### 2.1. Кэширование моделей InsightFace
+
+Перед первым запуском предварительно скачайте модель `buffalo_l`, чтобы избежать загрузки при старте:
+
+```bash
+python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='buffalo_l', root='models', providers=['CPUExecutionProvider']).prepare(ctx_id=-1, det_size=(640,640))"
+```
+
+Готовые файлы моделей появятся в папке `models/`.
+
 ### 2.1. Настройка переменных окружения AI-сервера
 
 Скопируйте `.env.example` в `.env` и проверьте значения:
@@ -137,7 +147,18 @@ bin/ffmpeg.exe
 
 ---
 
-## Структура базы данных
+## Производственная эксплуатация
+
+### Ротация хранилищ
+При долгой работе 24/7 добавьте периодическую очистку:
+- папки с HLS-сегментами и записями;
+- старых логов.
+
+Рекомендация: хранить записи не дольше 7 дней и ограничивать общий размер хранилища видео порогом, например 10 ГБ.
+
+### Мониторинг
+- `/health` — доступность Python Face Engine.
+- `/status` — количество векторов в FAISS и настройки распознавания.
 
 | Таблица          | Описание                          |
 |------------------|-----------------------------------|
