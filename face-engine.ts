@@ -19,6 +19,7 @@ import { prisma } from "./db.js";
 // ─── Конфигурация ────────────────────────────────────────────────────────────
 
 const FACE_SERVER_URL = process.env.FACE_SERVER_URL || "http://localhost:8001";
+const FACE_API_KEY = process.env.FACE_API_KEY || "";
 const USE_PYTHON_SERVER = true;
 
 // Health check
@@ -693,9 +694,14 @@ async function syncIndexWithPython(): Promise<void> {
       descriptor: Array.from(d.descriptor),
     }));
 
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (FACE_API_KEY) {
+      headers["X-API-Key"] = FACE_API_KEY;
+    }
+
     const response = await fetch(`${FACE_SERVER_URL}/update-index`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ persons }),
     });
 

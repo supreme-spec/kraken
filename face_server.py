@@ -10,6 +10,8 @@ import os
 import io
 import json
 import logging
+import sqlite3
+import base64
 import time
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import faiss
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -30,6 +32,8 @@ MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "60"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.8"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.55"))
+API_KEY: str = os.getenv("FACE_API_KEY", "super-secret-change-me")
+DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -67,6 +71,14 @@ cooldown_lock = threading.Lock()
 
 _frame_counter = 0
 frame_lock = threading.Lock()
+
+
+# ─── Security Middleware ──────────────────────────────────────────────────────
+
+def verify_api_key(x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return True
 
 
 # ─── GPU Provider Selection ───────────────────────────────────────────────────
@@ -154,42 +166,110 @@ except Exception as e:
     is_initialized = False
 
 
+# ─── SQLite Auto-Load ─────────────────────────────────────────────────────────
+
+def load_descriptors_from_sqlite(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    """Loads descriptors directly from SQLite for auto-indexing on startup with WAL mode."""
+    if not os.path.exists(db_path):
+        logger.warning(f"SQLite DB not found at {db_path}, skipping auto-index.")
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("""
+            SELECT fd.person_id, p.name as person_name, p.category, fd.photo_path, fd.descriptor
+            FROM FaceDescriptor fd
+            JOIN Person p ON p.id = fd.person_id
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        descriptors: List[Dict[str, Any]] = []
+        for row in rows:
+            desc_raw = row["descriptor"]
+            if isinstance(desc_raw, bytes):
+                desc_raw = desc_raw.decode("utf-8")
+
+            desc_list: List[float] = []
+            if isinstance(desc_raw, str):
+                if desc_raw.strip().startswith("["):
+                    desc_list = json.loads(desc_raw)
+                else:
+                    try:
+                        decoded = base64.b64decode(desc_raw)
+                        desc_list = np.frombuffer(decoded, dtype=np.float32).tolist()
+                    except Exception:
+                        desc_list = []
+
+            if not desc_list or len(desc_list) != 512:
+                continue
+
+            descriptors.append({
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+                "category": row["category"] or "",
+                "photo_path": row["photo_path"] or "",
+                "descriptor": desc_list,
+            })
+
+        logger.info(f"Loaded {len(descriptors)} valid descriptors from SQLite.")
+        return descriptors
+    except Exception as e:
+        logger.error(f"Failed to load descriptors from SQLite: {e}")
+        return []
+
+
+if is_initialized:
+    try:
+        initial_descriptors = load_descriptors_from_sqlite()
+        if initial_descriptors:
+            _build_faiss_index(initial_descriptors)
+        else:
+            logger.info("No descriptors found in DB. FAISS index is empty.")
+    except Exception as e:
+        logger.error(f"Auto-index build failed: {e}")
+
+
 # ─── FAISS Helpers ────────────────────────────────────────────────────────────
 
 def _build_faiss_index(descriptors: List[Dict[str, Any]]) -> None:
-    """Rebuilds FAISS index from normalized descriptors."""
+    """Атомарно перестраивает FAISS индекс, блокируя чтение только на время замены."""
     global faiss_index, faiss_index_id_to_person
 
     if not descriptors:
-        faiss_index = None
-        faiss_index_id_to_person = []
+        with faiss_lock:
+            faiss_index = None
+            faiss_index_id_to_person = []
         logger.info("FAISS index cleared (no descriptors).")
         return
 
     dim = 512
     matrix = np.zeros((len(descriptors), dim), dtype=np.float32)
+    person_mapping = []
+
     for i, item in enumerate(descriptors):
         arr = np.array(item["descriptor"], dtype=np.float32)
         norm = np.linalg.norm(arr)
         if norm > 1e-12:
-            arr = arr / norm
-        matrix[i] = arr
+            matrix[i] = arr / norm
+        person_mapping.append({
+            "person_id": item["person_id"],
+            "person_name": item["person_name"],
+            "category": item.get("category", ""),
+            "photo_path": item.get("photo_path", ""),
+        })
+
+    new_index = faiss.IndexFlatIP(dim)
+    new_index.add(matrix)
 
     with faiss_lock:
-        index = faiss.IndexFlatIP(dim)
-        index.add(matrix)
-        faiss_index = index
-        faiss_index_id_to_person = [
-            {
-                "person_id": item["person_id"],
-                "person_name": item["person_name"],
-                "category": item.get("category", ""),
-                "photo_path": item.get("photo_path", ""),
-            }
-            for item in descriptors
-        ]
+        faiss_index = new_index
+        faiss_index_id_to_person = person_mapping
 
-    logger.info(f"FAISS index built: {index.ntotal} vectors, dim={dim}.")
+    logger.info(f"FAISS index atomically swapped: {new_index.ntotal} vectors, dim={dim}.")
 
 
 def get_faiss_matches(query_vector: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
@@ -265,10 +345,14 @@ def get_cooldown_key(person_id: Any, category: str = "") -> str:
 
 
 def is_on_cooldown(person_id: Any, category: str = "") -> bool:
-    """Returns True if person was recognized recently."""
+    """Returns True if person was recognized recently. Cleans up expired entries."""
     key = get_cooldown_key(person_id, category)
     now = time.time()
     with cooldown_lock:
+        expired_keys = [k for k, v in last_recognition_time.items() if now - v > (COOLDOWN_SECONDS * 2)]
+        for k in expired_keys:
+            del last_recognition_time[k]
+
         last_time = last_recognition_time.get(key, 0.0)
         if now - last_time < COOLDOWN_SECONDS:
             logger.debug(f"Cooldown active for {key} ({now - last_time:.1f}s < {COOLDOWN_SECONDS}s)")
@@ -412,14 +496,12 @@ async def recognize(
     apply_cooldown: Optional[bool] = True,
 ):
     """
-    Full recognition pipeline:
-      1. Frame skip check (stateless, but demonstrates pattern)
-      2. Detect faces with quality gate
-      3. Extract embedding
-      4. FAISS search
-      5. Cooldown / debounce
-      6. Return best match or 'unknown'
+    Full recognition pipeline.
+    OPTIMIZED: Frame skip check happens BEFORE image decoding to save I/O and CPU.
     """
+    if not should_process_frame():
+        return {"matches": [], "status": "skipped"}
+
     try:
         image_bytes = await image.read()
         img = load_image_from_bytes(image_bytes)
@@ -429,9 +511,6 @@ async def recognize(
 
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
-
-        if not should_process_frame():
-            return {"matches": [], "status": "skipped"}
 
         faces = face_app.get(img)
         if not faces:
@@ -504,6 +583,9 @@ async def recognize_by_descriptor(
       "person_label": "optional_label_for_cooldown"
     }
     """
+    if not should_process_frame():
+        return {"matches": [], "status": "skipped"}
+
     try:
         descriptor_raw = payload.get("descriptor")
         if not descriptor_raw:
@@ -555,23 +637,10 @@ async def recognize_by_descriptor(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/update-index")
+@app.post("/update-index", dependencies=[Depends(verify_api_key)])
 async def update_index(payload: Dict[str, Any]):
     """
-    Rebuilds FAISS index from provided persons data.
-    Expected payload:
-    {
-      "persons": [
-        {
-          "person_id": 1,
-          "person_name": "John Doe",
-          "category": "STAFF",
-          "photo_path": "/photos/1.jpg",
-          "descriptor": [float, float, ...]  // 512-d
-        },
-        ...
-      ]
-    }
+    Rebuilds FAISS index securely. Requires X-API-Key header.
     """
     try:
         persons = payload.get("persons", [])
