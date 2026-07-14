@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import Sidebar from './components/Sidebar'
 import TopBar from './components/TopBar'
 import AlertPopup from './components/AlertPopup'
+import ConfirmPopup from './components/ConfirmPopup'
 import ReleaseButton from './components/ReleaseButton'
 import ProjectionPanel from './components/ProjectionPanel'
 import LiveMonitor from './pages/LiveMonitor'
@@ -16,7 +17,7 @@ import SmartRecording from './pages/SmartRecording'
 import Categories from './pages/Categories'
 import Requirements from './pages/Requirements'
 import Confirmations from './pages/Confirmations'
-import type { Camera, KrakenEvent, AlertMessage, FaceDetection } from './types'
+import type { Camera, KrakenEvent, AlertMessage, ConfirmationMessage, FaceDetection } from './types'
 import { apiFetch } from './api/client'
 import { wsUrl } from './api/client'
 import { usePushNotifications } from './hooks/usePushNotifications'
@@ -53,6 +54,10 @@ export default function App() {
   const [recentEvents, setRecentEvents] = useState<KrakenEvent[]>([])
   const [currentAlert, setCurrentAlert] = useState<AlertMessage | null>(null)
   const [alertHistory, setAlertHistory] = useState<AlertMessage[]>([])
+  // Очередь запросов подтверждения оператора («серая зона» распознавания).
+  // Бэкенд шлёт WS `{ type: "CONFIRMATION" }` — показываем живой попап с Да/Нет.
+  const [confirmationQueue, setConfirmationQueue] = useState<ConfirmationMessage[]>([])
+  const currentConfirmation = confirmationQueue[0] ?? null
   const [latestFace, setLatestFace] = useState<FaceDetection | null>(null)
   const [showProjection, setShowProjection] = useState(false)
   const [notifyEnabled, setNotifyEnabled] = useState(() =>
@@ -146,7 +151,19 @@ export default function App() {
         // Обычное распознавание (CLIENT/STAFF) — обновляем ленту
         fetchRecentEvents()
       } else if (msg.type === 'CONFIRMATION') {
-        // Запрос на подтверждение оператора — обновляем ленту событий
+        // Запрос на подтверждение оператора («серая зона»). Показываем живой
+        // попап с кнопками Да/Нет (Human-in-the-Loop) и обновляем ленту.
+        const conf = msg as ConfirmationMessage
+        clientLogger.info('Запрос подтверждения оператора', {
+          confirmation_id: conf.confirmation_id,
+          person: conf.person_name,
+          confidence: conf.confidence,
+        })
+        setConfirmationQueue(prev => {
+          // Дедуп: не дублируем один и тот же confirmation_id
+          if (prev.some(c => c.confirmation_id === conf.confirmation_id)) return prev
+          return [...prev, conf]
+        })
         fetchRecentEvents()
       }
     } catch (err) {
@@ -191,6 +208,11 @@ export default function App() {
 
   const goToEvents = useCallback(() => setPage('events'), [])
   const goToPeople = useCallback(() => setPage('people'), [])
+
+  // Закрыть/снять текущий запрос подтверждения (после решения или вручную)
+  const dismissConfirmation = useCallback(() => {
+    setConfirmationQueue(prev => prev.slice(1))
+  }, [])
 
   const renderPage = () => {
     switch (page) {
@@ -289,6 +311,12 @@ export default function App() {
       <AlertPopup
         alert={currentAlert}
         onDismiss={() => setCurrentAlert(null)}
+      />
+
+      <ConfirmPopup
+        confirmation={currentConfirmation}
+        onResolved={dismissConfirmation}
+        onDismiss={dismissConfirmation}
       />
 
       {showProjection && (

@@ -120,3 +120,22 @@ export interface AlertMessage {
   photo_path?: string   // person's registered photo (fallback when snapshot missing)
   timestamp: string
 }
+
+/**
+ * «Серая зона» (Human-in-the-Loop): бэкенд прислал кандидата из базы с
+ * уверенностью в диапазоне low_threshold..confirmation_threshold. Оператор
+ * должен подтвердить (Да/Нет) прямо в живом UI. Соответствует WS-сообщению
+ * `{ type: "CONFIRMATION", ... }` из server.ts (handleConfirmationEvent).
+ */
+export interface ConfirmationMessage {
+  type: 'CONFIRMATION'
+  confirmation_id: number
+  person_id: number
+  person_name: string
+  category: string
+  confidence: number
+  camera_id?: number
+  temp_photo: string      // захваченный кадр (новое фото лица) — `/confirmations/...jpg`
+  existing_photo: string | null  // фото из базы (зарегистрированное) — `/photos/...jpg`
+  timestamp?: string
+}
