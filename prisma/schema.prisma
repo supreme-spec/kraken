@@ -68,6 +68,7 @@ model Person {
   embedding_count Int               @default(0)
   
   photos          PersonPhoto[]
+  confirmations   FaceConfirmation[]
   events          Event[]
   incidents       Incident[]
   tags            Tag[]
@@ -92,9 +93,35 @@ model PersonPhoto {
   photo_path    String
   is_primary    Boolean  @default(false)
   has_embedding Boolean  @default(false)
+  source        String   @default("manual") // manual | confirmation | auto
+  confidence    Float?
   created_at    DateTime @default(now())
-  
+
   person        Person   @relation(fields: [person_id], references: [id], onDelete: Cascade)
+
+  @@index([person_id])
+  @@map("person_photos")
+}
+
+model FaceConfirmation {
+  id                  Int       @id @default(autoincrement())
+  person_id           Int
+  confidence          Float
+  temp_photo_path     String
+  existing_photo_path String?
+  person_name         String?
+  category            String?
+  status              String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  created_at          DateTime  @default(now())
+  confirmed_at        DateTime?
+  confirmed_by        String?
+  rejected_reason     String?
+
+  person              Person    @relation(fields: [person_id], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([person_id])
+  @@map("face_confirmations")
 }
 
 model Event {

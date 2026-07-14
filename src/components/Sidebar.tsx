@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Video, Users, BookImage, Activity, Camera, Settings, Monitor, Grid2X2, BookOpen, Tag } from 'lucide-react'
+import { Video, Users, BookImage, Activity, Camera, Settings, Monitor, Grid2X2, BookOpen, Tag, UserCheck } from 'lucide-react'
 import logoImg from '../assets/images/einfach_logo_1783510147919.jpg'
 
 interface SidebarProps {
@@ -55,6 +55,7 @@ export default function Sidebar({ currentPage, onNavigate, onProjection, project
         <NavItem id="chronicle"  label="Фотохроника"  icon={BookImage}  current={currentPage} onNavigate={onNavigate} />
         <NavItem id="recordings" label="Умная съёмка"  icon={Video}      current={currentPage} onNavigate={onNavigate} />
         <NavItem id="events"     label="События"      icon={Activity}   current={currentPage} onNavigate={onNavigate} />
+        <NavItem id="confirmations" label="Подтверждения" icon={UserCheck} current={currentPage} onNavigate={onNavigate} />
         <NavItem id="categories" label="Категории"    icon={Tag}        current={currentPage} onNavigate={onNavigate} />
 
         {/* Настройки */}

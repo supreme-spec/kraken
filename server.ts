@@ -28,6 +28,7 @@ import {
   getEngineStatus,
   assessPhotoQuality,
   searchByDescriptor,
+  addEmbeddingToPerson,
 } from "./face-engine.js";
 import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
@@ -197,6 +198,9 @@ const DEFAULT_TAG_TYPES = {
 // ── SETTINGS STATE (синхронизируются с БД через Settings table) ──
 let active_categories: string[] = ["BLACKLIST", "RESPONSE", "VIP"];
 let recognition_threshold_pct = 45;
+// Банд подтверждения оператора: между low и confirmation — «возможно, это person».
+let confirmation_threshold_pct = 55; // >= → авто-распознано (подтверждение не нужно)
+let low_threshold_pct = 40;          // <  → неизвестный (без подтверждения)
 let verification_threshold_pct = 60;
 let embedding_cache_enabled = true;
 let embedding_cache_ttl_days = 30;
@@ -1519,6 +1523,154 @@ app.post(["/api/failed_embeddings/bulk_delete", "/api/failed_embeddings/bulk_del
   res.json({ ok: true, message: `Успешно удалено ${ids.length} снимков` });
 });
 
+// ── OPERATOR CONFIRMATION (semi-supervised learning) ──────────────────────────
+
+// Список ожидающих подтверждений
+app.get(["/api/confirmations/pending", "/api/confirmations/pending/"], async (req, res) => {
+  try {
+    const confirmations = await prisma.faceConfirmation.findMany({
+      where: { status: "PENDING" },
+      include: {
+        person: { select: { id: true, name: true, category: true, photo_path: true } },
+      },
+      orderBy: { created_at: "desc" },
+      take: 50,
+    });
+    res.json(confirmations);
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/confirmations/pending" });
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// Подтвердить: это тот же человек → добавить фото+эмбеддинг к существующей персоне
+app.post(["/api/confirmations/:id/approve", "/api/confirmations/:id/approve/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const operator_id = (req.body?.operator_id as string) || "system";
+    const conf = await prisma.faceConfirmation.findUnique({ where: { id } });
+    if (!conf) return res.status(404).json({ detail: "Confirmation not found" });
+    if (conf.status !== "PENDING") return res.status(409).json({ detail: `Already ${conf.status}` });
+
+    const tempFull = path.join(publicDir, conf.temp_photo_path);
+    if (!fs.existsSync(tempFull)) return res.status(404).json({ detail: "Temp photo missing" });
+    const buf = await fs.promises.readFile(tempFull);
+
+    // Извлекаем эмбеддинг (строгий ворот; fallback на мягкий, если кадр «на грани»)
+    let descriptor = (await extractEmbedding(buf, { strict: true })).descriptor;
+    if (!descriptor) {
+      const soft = await getEmbedding(buf);
+      if (!soft) return res.status(422).json({ detail: "Не удалось извлечь эмбеддинг из фото подтверждения" });
+      descriptor = soft;
+    }
+
+    const person = await prisma.person.findUnique({ where: { id: conf.person_id } });
+    if (!person) return res.status(404).json({ detail: "Person not found" });
+
+    const newName = `confirm_${conf.person_id}_${conf.id}_${Date.now()}.jpg`;
+    const photo_path = `photos/${newName}`;
+    await fs.promises.writeFile(path.join(publicDir, photo_path), buf);
+
+    await prisma.personPhoto.create({
+      data: {
+        person_id: conf.person_id,
+        photo_path,
+        is_primary: false,
+        has_embedding: true,
+        source: "confirmation",
+        confidence: conf.confidence,
+      },
+    });
+
+    const reg = await addEmbeddingToPerson(conf.person_id, person.name, person.category, photo_path, descriptor);
+    if (!reg.success) return res.status(500).json({ detail: reg.error || "Не удалось добавить дескриптор" });
+
+    await prisma.faceConfirmation.update({
+      where: { id },
+      data: { status: "APPROVED", confirmed_at: new Date(), confirmed_by: operator_id },
+    });
+
+    // Временное фото уже скопировано в photos/ — удаляем оригинал из confirmations/
+    try { await fs.promises.unlink(tempFull); } catch { /* ignore */ }
+
+    const pIdx = persons.findIndex((p: any) => p.id === conf.person_id);
+    if (pIdx >= 0) persons[pIdx].embedding_count = (persons[pIdx].embedding_count || 0) + 1;
+
+    broadcastSecurity({ type: "CONFIRMATION_RESOLVED", confirmation_id: id, status: "APPROVED", person_id: conf.person_id });
+    res.json({ success: true, message: "Фото добавлено, точность распознавания улучшена", person_id: conf.person_id });
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/confirmations/:id/approve" });
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// Отклонить: это другой человек → создать нового «Неизвестного»
+app.post(["/api/confirmations/:id/reject", "/api/confirmations/:id/reject/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const operator_id = (req.body?.operator_id as string) || "system";
+    const reason = (req.body?.reason as string) || "Не тот человек";
+    const conf = await prisma.faceConfirmation.findUnique({ where: { id } });
+    if (!conf) return res.status(404).json({ detail: "Confirmation not found" });
+    if (conf.status !== "PENDING") return res.status(409).json({ detail: `Already ${conf.status}` });
+
+    const tempFull = path.join(publicDir, conf.temp_photo_path);
+    let newPersonId: number | null = null;
+
+    if (fs.existsSync(tempFull)) {
+      const buf = await fs.promises.readFile(tempFull);
+      const newName = `unknown_conf_${id}_${Date.now()}.jpg`;
+      const photo_path = `photos/${newName}`;
+      await fs.promises.writeFile(path.join(publicDir, photo_path), buf);
+
+      const newPerson = await prisma.person.create({
+        data: { name: "Неизвестный", category: "CLIENT", is_active: true, visit_count: 0, embedding_count: 0 },
+      });
+      newPersonId = newPerson.id;
+
+      const reg = await registerFacePerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, path.join(publicDir, photo_path));
+      await prisma.personPhoto.create({
+        data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: reg.hasEmbedding },
+      });
+      await prisma.person.update({
+        where: { id: newPerson.id },
+        data: { photo_path, embedding_count: reg.hasEmbedding ? 1 : 0 },
+      });
+
+      const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
+      if (created) persons.unshift({ ...created });
+
+      try { await fs.promises.unlink(tempFull); } catch { /* ignore */ }
+    }
+
+    await prisma.faceConfirmation.update({
+      where: { id },
+      data: { status: "REJECTED", rejected_reason: reason, confirmed_at: new Date(), confirmed_by: operator_id },
+    });
+
+    broadcastSecurity({ type: "CONFIRMATION_RESOLVED", confirmation_id: id, status: "REJECTED", person_id: conf.person_id, new_person_id: newPersonId });
+    res.json({ success: true, message: "Создана новая запись «Неизвестный»", new_person_id: newPersonId });
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/confirmations/:id/reject" });
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// Статистика подтверждений
+app.get(["/api/confirmations/stats", "/api/confirmations/stats/"], async (req, res) => {
+  try {
+    const [pending, approved, rejected] = await Promise.all([
+      prisma.faceConfirmation.count({ where: { status: "PENDING" } }),
+      prisma.faceConfirmation.count({ where: { status: "APPROVED" } }),
+      prisma.faceConfirmation.count({ where: { status: "REJECTED" } }),
+    ]);
+    res.json({ pending, approved, rejected });
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/confirmations/stats" });
+    res.status(500).json({ detail: err.message });
+  }
+});
+
 // EVENTS API
 app.get(["/api/events", "/api/events/"], async (req, res) => {
   try {
@@ -1797,7 +1949,8 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
   try {
     const [
       cacheEnabled, cacheTtl, qualityThreshold, adaptiveSkip,
-      faissThreshold, faissNprobe, camWeights, verifyThreshold, autoCreateUnknown
+      faissThreshold, faissNprobe, camWeights, verifyThreshold, autoCreateUnknown,
+      confirmThreshold, lowThreshold
     ] = await Promise.all([
       loadSetting("embedding_cache_enabled", embedding_cache_enabled),
       loadSetting("embedding_cache_ttl_days", embedding_cache_ttl_days),
@@ -1808,6 +1961,8 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       loadSetting("camera_priority_weights", camera_priority_weights),
       loadSetting("verification_threshold_pct", verification_threshold_pct),
       loadSetting("auto_create_unknown_persons", auto_create_unknown_persons),
+      loadSetting("confirmation_threshold_pct", confirmation_threshold_pct),
+      loadSetting("low_threshold_pct", low_threshold_pct),
     ]);
     // Sync in-memory
     embedding_cache_enabled = cacheEnabled;
@@ -1819,6 +1974,8 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
     camera_priority_weights = camWeights;
     verification_threshold_pct = verifyThreshold;
     auto_create_unknown_persons = autoCreateUnknown;
+    confirmation_threshold_pct = confirmThreshold;
+    low_threshold_pct = lowThreshold;
 
     res.json({
       embedding_cache_enabled,
@@ -1830,6 +1987,8 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       camera_priority_weights,
       verification_threshold_pct,
       auto_create_unknown_persons,
+      confirmation_threshold_pct,
+      low_threshold_pct,
     });
   } catch (err) {
     logError(err as Error, { path: "/api/settings", method: "GET" });
@@ -1875,6 +2034,14 @@ app.post(["/api/settings", "/api/settings/"], async (req, res) => {
     if (req.body.auto_create_unknown_persons !== undefined) {
       auto_create_unknown_persons = !!req.body.auto_create_unknown_persons;
       saves.push(saveSetting("auto_create_unknown_persons", auto_create_unknown_persons));
+    }
+    if (req.body.confirmation_threshold_pct !== undefined) {
+      confirmation_threshold_pct = req.body.confirmation_threshold_pct;
+      saves.push(saveSetting("confirmation_threshold_pct", confirmation_threshold_pct));
+    }
+    if (req.body.low_threshold_pct !== undefined) {
+      low_threshold_pct = req.body.low_threshold_pct;
+      saves.push(saveSetting("low_threshold_pct", low_threshold_pct));
     }
     await Promise.all(saves);
     res.json({ ok: true, updated: Object.keys(req.body), message: "Настройки успешно сохранены" });
@@ -2762,7 +2929,8 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
 
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
 async function processDetectedFaces(cam: any, frameBase64: string, faces: any[]): Promise<any[]> {
-  const threshold = recognition_threshold_pct / 100;
+  const lowT = low_threshold_pct / 100;
+  const confirmT = confirmation_threshold_pct / 100;
   const enriched: any[] = [];
   for (let i = 0; i < faces.length; i++) {
     const f = faces[i];
@@ -2774,26 +2942,46 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     const bbox: [number, number, number, number] = [x, y, x + w, y + h];
     const desc = f.descriptor;
 
+    // Ищем до НИЖНЕГО порога бэнда, чтобы поймать кандидатов 40-55% (подтверждение)
     let match: any = null;
     if (desc && desc.length) {
-      const matches = await searchByDescriptor(desc, threshold, 1);
+      const matches = await searchByDescriptor(desc, lowT, 1);
       if (matches.length) match = matches[0];
     }
+    const sim = match ? match.similarity : 0;
 
-    if (match) {
+    if (match && sim >= confirmT) {
+      // Уверенное совпадение (>= confirmation_threshold) → авто-распознано
       enriched.push({
         track_id: i + 1,
         bbox,
         person_id: match.personId,
         person_name: match.personName,
         category: match.category,
-        confidence: match.similarity,
+        confidence: sim,
         box: f.box,
       });
       const key = `${cam.id}:p${match.personId}`;
       if (Date.now() - (lastEventAt.get(key) || 0) > RECOGNIZED_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
         await handleRecognizedEvent(cam, match, frameBase64);
+      }
+    } else if (match && sim >= lowT) {
+      // БЭНД ПОДТВЕРЖДЕНИЯ ОПЕРАТОРА (low_threshold .. confirmation_threshold)
+      enriched.push({
+        track_id: i + 1,
+        bbox,
+        person_id: match.personId,
+        person_name: match.personName,
+        category: match.category,
+        confidence: sim,
+        box: f.box,
+        needs_confirmation: true,
+      });
+      const key = `${cam.id}:conf${match.personId}`;
+      if (Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
+        lastEventAt.set(key, Date.now());
+        await handleConfirmationEvent(cam, match, frameBase64, f);
       }
     } else {
       enriched.push({
@@ -2812,6 +3000,80 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     }
   }
   return enriched;
+}
+
+// Подтверждения оператора: дебаунс создания pending-записей + папка временных фото
+const lastConfirmationAt = new Map<string, number>();
+const CONFIRMATION_COOLDOWN_MS = 30_000;
+const confirmationsDir = path.join(publicDir, "confirmations");
+
+/**
+ * Создаёт запрос на подтверждение оператора, когда лицо похоже на известного
+ * (band low..confirmation). Сохраняет кадр, пишет FaceConfirmation (PENDING),
+ * шлёт событие и WS-уведомление. Дедуп по паре камера-персона.
+ */
+async function handleConfirmationEvent(cam: any, match: any, frameBase64: string, face: any) {
+  const personId = match.personId;
+  const key = `${cam.id}:conf${personId}`;
+  // Дебаунс: не плодим подтверждения для одной пары камера-персона подряд
+  if (Date.now() - (lastConfirmationAt.get(key) || 0) < CONFIRMATION_COOLDOWN_MS) return;
+  lastConfirmationAt.set(key, Date.now());
+
+  try {
+    if (!fs.existsSync(confirmationsDir)) fs.mkdirSync(confirmationsDir, { recursive: true });
+    const filename = `confirm_${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
+    const tempFull = path.join(confirmationsDir, filename);
+    await fs.promises.writeFile(tempFull, Buffer.from(frameBase64, "base64"));
+    const temp_photo_path = `confirmations/${filename}`;
+
+    const candidate = persons.find((p: any) => p.id === personId);
+    const existing_photo_path = candidate?.photo_path || null;
+
+    const confirmation = await prisma.faceConfirmation.create({
+      data: {
+        person_id: personId,
+        confidence: match.similarity,
+        temp_photo_path,
+        existing_photo_path,
+        person_name: match.personName,
+        category: match.category,
+        status: "PENDING",
+      },
+    });
+
+    // Событие в ленту (оператор видит в «Событиях»)
+    const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, match.personName);
+    recordVisitor(cam.id, personId, match.personName, snapshot_path);
+    await persistAndBroadcastEvent({
+      cameraId: cam.id,
+      cameraName: cam.name,
+      personId,
+      event_type: "CONFIRMATION",
+      confidence: match.similarity,
+      snapshot_path,
+      person_name: match.personName,
+      person_category: match.category,
+      person_photo_path: existing_photo_path,
+      needs_operator_confirmation: true,
+      confirmation_status: "pending",
+    });
+
+    // Уведомление оператору через Security WebSocket
+    broadcastSecurity({
+      type: "CONFIRMATION",
+      confirmation_id: confirmation.id,
+      person_id: personId,
+      person_name: match.personName,
+      category: match.category,
+      confidence: match.similarity,
+      temp_photo: `/${temp_photo_path}`,
+      existing_photo: existing_photo_path ? `/${existing_photo_path}` : null,
+    });
+
+    triggerSmartRecording(cam);
+  } catch (e) {
+    logError(e as Error, { context: "handleConfirmationEvent", personId });
+  }
 }
 
 // Camera feed websocket client storage
@@ -3433,6 +3695,8 @@ async function seedDatabase() {
   // Load persisted settings
   recognition_threshold_pct = await loadSetting("recognition_threshold_pct", recognition_threshold_pct);
   verification_threshold_pct = await loadSetting("verification_threshold_pct", verification_threshold_pct);
+  confirmation_threshold_pct = await loadSetting("confirmation_threshold_pct", confirmation_threshold_pct);
+  low_threshold_pct = await loadSetting("low_threshold_pct", low_threshold_pct);
   active_categories = await loadSetting("active_categories", active_categories);
 
   logInfo(`Загружено: ${categories.length} категорий, ${persons.length} персон, ${cameras.length} камер`);

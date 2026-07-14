@@ -15,6 +15,7 @@ import Chronicle from './pages/Chronicle'
 import SmartRecording from './pages/SmartRecording'
 import Categories from './pages/Categories'
 import Requirements from './pages/Requirements'
+import Confirmations from './pages/Confirmations'
 import type { Camera, KrakenEvent, AlertMessage, FaceDetection } from './types'
 import { apiFetch } from './api/client'
 import { wsUrl } from './api/client'
@@ -144,6 +145,9 @@ export default function App() {
       } else if (msg.type === 'EVENT') {
         // Обычное распознавание (CLIENT/STAFF) — обновляем ленту
         fetchRecentEvents()
+      } else if (msg.type === 'CONFIRMATION') {
+        // Запрос на подтверждение оператора — обновляем ленту событий
+        fetchRecentEvents()
       }
     } catch (err) {
       clientLogger.error(err as Error, { context: 'WebSocket message' })
@@ -228,6 +232,8 @@ export default function App() {
         return <Settings />
       case 'categories':
         return <Categories />
+      case 'confirmations':
+        return <Confirmations />
       default:
         return (
           <LiveMonitor

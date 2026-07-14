@@ -1031,6 +1031,62 @@ export async function registerPersonFromDescriptor(
   }
 }
 
+/**
+ * Добавляет ДОПОЛНИТЕЛЬНЫЙ референсный дескриптор к УЖЕ существующей персоне
+ * (используется при подтверждении оператора: «это тот же человек»).
+ * Сохраняет дескриптор в БД и пересинхронизирует FAISS-индекс.
+ */
+export async function addEmbeddingToPerson(
+  personId: number,
+  personName: string,
+  category: string,
+  photoPath: string,
+  descriptor: Float32Array | number[]
+): Promise<{ success: boolean; hasEmbedding: boolean; error?: string }> {
+  try {
+    const desc = descriptor instanceof Float32Array ? descriptor : new Float32Array(descriptor);
+
+    if (!desc || desc.length === 0) {
+      return { success: false, hasEmbedding: false, error: "Пустой дескриптор" };
+    }
+
+    // Дедуп: убираем старый дескриптор с тем же фото
+    const existingIdx = storedDescriptors.findIndex(
+      (d) => d.personId === personId && d.photoPath === photoPath
+    );
+    if (existingIdx >= 0) storedDescriptors.splice(existingIdx, 1);
+
+    storedDescriptors.push({
+      personId,
+      personName,
+      category,
+      photoPath,
+      descriptor: desc,
+      descriptorList: Array.from(desc),
+    });
+
+    const saved = await saveDescriptorToDB(personId, personName, category, photoPath, desc);
+    if (!saved) {
+      const idx = storedDescriptors.findIndex(
+        (d) => d.personId === personId && d.photoPath === photoPath
+      );
+      if (idx >= 0) storedDescriptors.splice(idx, 1);
+      return { success: false, hasEmbedding: false, error: "Не удалось сохранить дескриптор в БД" };
+    }
+
+    logDebug(`Добавлен доп. дескриптор для "${personName}" (ID: ${personId}) из подтверждения оператора`);
+
+    await syncIndexWithPython().catch((e) =>
+      logWarn("FAISS sync skipped (Python недоступен)", { error: (e as Error).message })
+    );
+
+    return { success: true, hasEmbedding: true };
+  } catch (err) {
+    logError(err as Error, { context: "Добавление дескриптора существующей персоне", personId, personName });
+    return { success: false, hasEmbedding: false, error: (err as any).message };
+  }
+}
+
 export async function unregisterPerson(personId: number): Promise<void> {
   const before = storedDescriptors.length;
   let i = storedDescriptors.length;
