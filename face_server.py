@@ -858,10 +858,14 @@ async def recognize(
 
         matches: List[Dict[str, Any]] = []
         needs_confirmation_data = None
+        best_sim = 0.0
 
         for candidate in candidates:
             person = candidate["person"]
             sim = float(candidate["score"])
+
+            if sim > best_sim:
+                best_sim = sim
 
             if category and person.get("category") != category:
                 continue
@@ -896,6 +900,7 @@ async def recognize(
             "matches": matches[:top_k],
             "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
+            "best_similarity": best_sim,
         }
 
         if needs_confirmation_data and not matches:
@@ -945,10 +950,14 @@ async def recognize_by_descriptor(
 
         matches: List[Dict[str, Any]] = []
         needs_confirmation_data = None
+        best_sim = 0.0
 
         for candidate in candidates:
             person = candidate["person"]
             sim = float(candidate["score"])
+
+            if sim > best_sim:
+                best_sim = sim
 
             if category and person.get("category") != category:
                 continue
@@ -983,6 +992,7 @@ async def recognize_by_descriptor(
             "matches": matches[:top_k],
             "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
+            "best_similarity": best_sim,
         }
 
         if needs_confirmation_data and not matches:

@@ -736,15 +736,40 @@ async function recognizeDescriptorOnServer(
         photo_path: string;
         similarity: number;
       }>;
+      confirmation_candidate?: {
+        person_id: number;
+        person_name: string;
+        category: string;
+        photo_path: string;
+        similarity: number;
+      };
     };
 
-    return result.matches.map((m) => ({
+    const mapped = result.matches.map((m) => ({
       personId: m.person_id,
       personName: m.person_name,
       category: m.category,
       photoPath: m.photo_path,
       similarity: m.similarity,
     }));
+
+    // FIX: gray-zone candidates (LOW_THRESHOLD..CONFIRMATION_THRESHOLD, i.e. 40-55%)
+    // were returned only in `confirmation_candidate`, which this function used to
+    // ignore. As a result known people in that band were treated as unknown and
+    // turned into "Неизвестный" guests instead of going to operator confirmation.
+    // Surface the candidate so the live pipeline can route it correctly.
+    if (!mapped.length && result.confirmation_candidate) {
+      const c = result.confirmation_candidate;
+      mapped.push({
+        personId: c.person_id,
+        personName: c.person_name,
+        category: c.category,
+        photoPath: c.photo_path,
+        similarity: c.similarity,
+      });
+    }
+
+    return mapped;
   } catch (e) {
     logError(e as Error, { context: "Распознавание дескриптора на Python" });
     return [];
