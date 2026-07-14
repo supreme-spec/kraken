@@ -193,62 +193,6 @@ except Exception as e:
     is_initialized = False
 
 
-# ─── SQLite Auto-Load ─────────────────────────────────────────────────────────
-
-def load_descriptors_from_sqlite(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
-    """Loads descriptors directly from SQLite for auto-indexing on startup with WAL mode."""
-    if not os.path.exists(db_path):
-        logger.warning(f"SQLite DB not found at {db_path}, skipping auto-index.")
-        return []
-
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("""
-            SELECT fd.person_id, p.name as person_name, p.category, fd.photo_path, fd.descriptor
-            FROM FaceDescriptor fd
-            JOIN Person p ON p.id = fd.person_id
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-
-        descriptors: List[Dict[str, Any]] = []
-        for row in rows:
-            desc_raw = row["descriptor"]
-            if isinstance(desc_raw, bytes):
-                desc_raw = desc_raw.decode("utf-8")
-
-            desc_list: List[float] = []
-            if isinstance(desc_raw, str):
-                if desc_raw.strip().startswith("["):
-                    desc_list = json.loads(desc_raw)
-                else:
-                    try:
-                        decoded = base64.b64decode(desc_raw)
-                        desc_list = np.frombuffer(decoded, dtype=np.float32).tolist()
-                    except Exception:
-                        desc_list = []
-
-            if not desc_list or len(desc_list) != 512:
-                continue
-
-            descriptors.append({
-                "person_id": row["person_id"],
-                "person_name": row["person_name"],
-                "category": row["category"] or "",
-                "photo_path": row["photo_path"] or "",
-                "descriptor": desc_list,
-            })
-
-        logger.info(f"Loaded {len(descriptors)} valid descriptors from SQLite.")
-        return descriptors
-    except Exception as e:
-        logger.error(f"Failed to load descriptors from SQLite: {e}")
-        return []
-
-
 # ─── FAISS Helpers ────────────────────────────────────────────────────────────
 
 def _build_faiss_index(descriptors: List[Dict[str, Any]]) -> None:
@@ -313,14 +257,68 @@ def get_faiss_matches(query_vector: np.ndarray, top_k: int = 5) -> List[Dict[str
         })
     return results
 
+# ─── SQLite Auto-Load ─────────────────────────────────────────────────────────
 
-# Авто-загрузка FAISS-индекса при старте. Блок расположен ПОСЛЕ определения
-# _build_faiss_index / get_faiss_matches, иначе NameError при is_initialized=True.
+def load_descriptors_from_sqlite(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    """Loads descriptors directly from SQLite for auto-indexing on startup with WAL mode."""
+    if not os.path.exists(db_path):
+        logger.warning(f"SQLite DB not found at {db_path}, skipping auto-index.")
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("""
+            SELECT fd.person_id, p.name as person_name, p.category, fd.photo_path, fd.descriptor
+            FROM FaceDescriptor fd
+            JOIN Person p ON p.id = fd.person_id
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        descriptors: List[Dict[str, Any]] = []
+        for row in rows:
+            desc_raw = row["descriptor"]
+            if isinstance(desc_raw, bytes):
+                desc_raw = desc_raw.decode("utf-8")
+
+            desc_list: List[float] = []
+            if isinstance(desc_raw, str):
+                if desc_raw.strip().startswith("["):
+                    desc_list = json.loads(desc_raw)
+                else:
+                    try:
+                        decoded = base64.b64decode(desc_raw)
+                        desc_list = np.frombuffer(decoded, dtype=np.float32).tolist()
+                    except Exception:
+                        desc_list = []
+
+            if not desc_list or len(desc_list) != 512:
+                continue
+
+            descriptors.append({
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+                "category": row["category"] or "",
+                "photo_path": row["photo_path"] or "",
+                "descriptor": desc_list,
+            })
+
+        logger.info(f"Loaded {len(descriptors)} valid descriptors from SQLite.")
+        return descriptors
+    except Exception as e:
+        logger.error(f"Failed to load descriptors from SQLite: {e}")
+        return []
+
+# ─── Startup Auto-Index (✅ ТЕПЕРЬ 100% БЕЗОПАСНО: вызов ПОСЛЕ объявления) ───
+
 if is_initialized:
     try:
         initial_descriptors = load_descriptors_from_sqlite()
         if initial_descriptors:
-            _build_faiss_index(initial_descriptors)
+            _build_faiss_index(initial_descriptors)  # ✅ ТЕПЕРЬ ЭТО РАБОТАЕТ!
         else:
             logger.info("No descriptors found in DB. FAISS index is empty.")
     except Exception as e:
