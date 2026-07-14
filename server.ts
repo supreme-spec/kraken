@@ -13,6 +13,9 @@ const execAsync = promisify(exec);
 import sharp from "sharp";
 import * as archiverLib from "archiver";
 import * as unzipper from "unzipper";
+import ExcelJS from "exceljs";
+import PDFDocument from "pdfkit";
+import AdmZip from "adm-zip";
 import {
   initFaceEngine,
   initFaceEngineWithDB,
@@ -3649,6 +3652,134 @@ app.post(["/api/face-engine/quality", "/api/face-engine/quality/"], upload.any()
     res.json(quality);
   } catch (err: any) {
     res.status(500).json({ detail: err.message });
+  }
+});
+
+// ── DOWNLOAD FULL BACKUP (GET) ──
+app.get("/api/backup/full", async (req, res) => {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const backupName = `kraken_backup_${timestamp}.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${backupName}"`);
+
+    const zip = new AdmZip();
+    const dbPath = path.join(process.cwd(), "prisma", "dev.db");
+    if (fs.existsSync(dbPath)) {
+      zip.addLocalFile(dbPath, "kraken.db");
+    }
+    if (fs.existsSync(photosDir)) zip.addLocalFolder(photosDir, "photos");
+    if (fs.existsSync(snapshotsDir)) zip.addLocalFolder(snapshotsDir, "snapshots");
+
+    const buffer = zip.toBuffer();
+    res.setHeader("Content-Length", buffer.length);
+    res.send(buffer);
+    logInfo(`Backup downloaded: ${backupName}`);
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/backup/full" });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── REPORTS: EXCEL ──
+app.get("/api/reports/excel", async (req, res) => {
+  try {
+    const days = parseInt(req.query.days as string) || 7;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    const events = await prisma.event.findMany({
+      where: { created_at: { gte: startDate } },
+      include: { person: true, camera: true },
+      orderBy: { created_at: "desc" },
+      take: 5000,
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet(`Отчёт за ${days} дней`);
+
+    worksheet.columns = [
+      { header: "Дата и время", key: "date", width: 20 },
+      { header: "Камера", key: "camera", width: 20 },
+      { header: "Имя", key: "name", width: 25 },
+      { header: "Категория", key: "category", width: 15 },
+      { header: "Уверенность", key: "confidence", width: 15 },
+      { header: "Тип события", key: "type", width: 15 },
+    ];
+
+    worksheet.getRow(1).font = { bold: true };
+    worksheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE0E0E0" } };
+
+    events.forEach((event) => {
+      worksheet.addRow({
+        date: new Date(event.created_at).toLocaleString("ru-RU"),
+        camera: event.camera_name || "Неизвестно",
+        name: event.person_name || "Неизвестный",
+        category: event.person_category || "-",
+        confidence: event.confidence ? `${(event.confidence * 100).toFixed(1)}%` : "-",
+        type: event.event_type || "recognition",
+      });
+    });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="report_${days}days.xlsx"`);
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/reports/excel" });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── REPORTS: PDF ──
+app.get("/api/reports/pdf", async (req, res) => {
+  try {
+    const days = parseInt(req.query.days as string) || 7;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    const events = await prisma.event.findMany({
+      where: { created_at: { gte: startDate } },
+      include: { person: true, camera: true },
+      orderBy: { created_at: "desc" },
+      take: 1000,
+    });
+
+    const doc = new PDFDocument({ margin: 50, size: "A4", layout: "landscape" });
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="report_${days}days.pdf"`);
+    doc.pipe(res);
+
+    doc.fontSize(16).text(`Отчёт о событиях за последние ${days} дней`, { align: "center" });
+    doc.moveDown();
+    doc.fontSize(9);
+
+    const tableTop = 100;
+    const headers = ["Дата", "Камера", "Имя", "Категория", "Событие"];
+    let xPos = 50;
+
+    headers.forEach((h) => { doc.text(h, xPos, tableTop); xPos += 140; });
+
+    let yPos = tableTop + 20;
+    events.forEach((event) => {
+      if (yPos > 500) { doc.addPage(); yPos = 50; }
+      xPos = 50;
+
+      doc.text(new Date(event.created_at).toLocaleString("ru-RU"), xPos, yPos);
+      doc.text(event.camera_name || "N/A", xPos + 140, yPos);
+      doc.text(event.person_name || "Неизвестный", xPos + 280, yPos);
+      doc.text(event.person_category || "-", xPos + 420, yPos);
+      doc.text(event.event_type || "recognition", xPos + 560, yPos);
+      yPos += 20;
+    });
+
+    doc.end();
+  } catch (err: any) {
+    logError(err as Error, { path: "/api/reports/pdf" });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
