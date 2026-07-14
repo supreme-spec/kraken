@@ -3733,6 +3733,16 @@ app.get("/api/reports/excel", async (req, res) => {
   }
 });
 
+// ── Шрифт с поддержкой кириллицы (стандартный шрифт pdfkit НЕ поддерживает русские буквы) ──
+function resolveFontPath(name: string): string | undefined {
+  const candidates = [
+    path.join(process.cwd(), "server", "fonts", name),
+    path.join(__dirname, "server", "fonts", name),
+    path.join(__dirname, "fonts", name),
+  ];
+  return candidates.find((p) => fs.existsSync(p));
+}
+
 // ── REPORTS: PDF ──
 app.get("/api/reports/pdf", async (req, res) => {
   try {
@@ -3749,12 +3759,24 @@ app.get("/api/reports/pdf", async (req, res) => {
 
     const doc = new PDFDocument({ margin: 50, size: "A4", layout: "landscape" });
 
+    // Кириллица: регистрируем Ttf-шрифт из проекта (server/fonts/arial*.ttf)
+    const fontRegular = resolveFontPath("arial.ttf");
+    const fontBold = resolveFontPath("arialbd.ttf");
+    if (fontRegular) {
+      doc.registerFont("Regular", fontRegular);
+      if (fontBold) doc.registerFont("Bold", fontBold);
+    } else {
+      logError(new Error("Шрифт с кириллицей не найден: server/fonts/arial.ttf"), { path: "/api/reports/pdf" });
+    }
+
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="report_${days}days.pdf"`);
     doc.pipe(res);
 
+    if (fontBold) doc.font("Bold");
     doc.fontSize(16).text(`Отчёт о событиях за последние ${days} дней`, { align: "center" });
     doc.moveDown();
+    if (fontRegular) doc.font("Regular");
     doc.fontSize(9);
 
     const tableTop = 100;
