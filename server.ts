@@ -1,12 +1,16 @@
 import express from "express";
 import path from "path";
+import { platform } from "os";
 import fs from "fs";
 import http from "http";
 import multer from "multer";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
-import { createServer as createViteServer } from "vite";
-import { spawn, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, exec, ChildProcessWithoutNullStreams } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
+import sharp from "sharp";
 import * as archiverLib from "archiver";
 import * as unzipper from "unzipper";
 import {
@@ -16,6 +20,7 @@ import {
   detectFacesFast,
   getEmbedding,
   registerPerson as registerFacePerson,
+  registerPersonFromDescriptor,
   unregisterPerson as unregisterFacePerson,
   searchByPhoto,
   rebuildDescriptorIndex,
@@ -196,6 +201,7 @@ let embedding_cache_enabled = true;
 let embedding_cache_ttl_days = 30;
 let face_quality_min_threshold = 0.10;
 let ai_adaptive_frame_skip = true;
+let auto_create_unknown_persons = true;
 let faiss_ivf_threshold = 1000;
 let faiss_ivf_nprobe = 10;
 let camera_priority_weights: Record<string, number> = {};
@@ -1719,7 +1725,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
   try {
     const [
       cacheEnabled, cacheTtl, qualityThreshold, adaptiveSkip,
-      faissThreshold, faissNprobe, camWeights, verifyThreshold
+      faissThreshold, faissNprobe, camWeights, verifyThreshold, autoCreateUnknown
     ] = await Promise.all([
       loadSetting("embedding_cache_enabled", embedding_cache_enabled),
       loadSetting("embedding_cache_ttl_days", embedding_cache_ttl_days),
@@ -1729,6 +1735,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       loadSetting("faiss_ivf_nprobe", faiss_ivf_nprobe),
       loadSetting("camera_priority_weights", camera_priority_weights),
       loadSetting("verification_threshold_pct", verification_threshold_pct),
+      loadSetting("auto_create_unknown_persons", auto_create_unknown_persons),
     ]);
     // Sync in-memory
     embedding_cache_enabled = cacheEnabled;
@@ -1739,6 +1746,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
     faiss_ivf_nprobe = faissNprobe;
     camera_priority_weights = camWeights;
     verification_threshold_pct = verifyThreshold;
+    auto_create_unknown_persons = autoCreateUnknown;
 
     res.json({
       embedding_cache_enabled,
@@ -1749,6 +1757,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       faiss_ivf_nprobe,
       camera_priority_weights,
       verification_threshold_pct,
+      auto_create_unknown_persons,
     });
   } catch (err) {
     logError(err as Error, { path: "/api/settings", method: "GET" });
@@ -1790,6 +1799,10 @@ app.post(["/api/settings", "/api/settings/"], async (req, res) => {
     if (req.body.verification_threshold_pct !== undefined) {
       verification_threshold_pct = req.body.verification_threshold_pct;
       saves.push(saveSetting("verification_threshold_pct", verification_threshold_pct));
+    }
+    if (req.body.auto_create_unknown_persons !== undefined) {
+      auto_create_unknown_persons = !!req.body.auto_create_unknown_persons;
+      saves.push(saveSetting("auto_create_unknown_persons", auto_create_unknown_persons));
     }
     await Promise.all(saves);
     res.json({ ok: true, updated: Object.keys(req.body), message: "Настройки успешно сохранены" });
@@ -2239,7 +2252,7 @@ function buildFfmpegInputArgs(cam: any): string[] {
       const idx = parseInt(m[1], 10);
       inputSource = idx === 0 ? "USB Video Device" : `USB Video Device #${idx + 1}`;
     }
-    return ["-f", "dshow", "-i", `video=${inputSource}`];
+    return ["-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", `video=${inputSource}`];
   }
   // RTSP / IP / Hikvision / UNV: подставляем сохранённые учётные данные в URL, если их нет в source
   let source = (cam.source || "").trim();
@@ -2253,7 +2266,8 @@ function buildFfmpegInputArgs(cam: any): string[] {
       // не URL — оставляем как есть
     }
   }
-  return ["-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
+  // -hide_banner + -loglevel error: не засоряем логи баннером версии/конфигурации на каждом (пере)запуске
+  return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
 }
 
 // Активные записи видео: cameraId -> сессия
@@ -2273,11 +2287,15 @@ function recordToChronicle(rec: any) {
     id: rec.id,
     camera_id: rec.camera_id,
     filename: path.basename(rec.video_path),
+    // Абсолютный URL для <video>/fetch (раздаётся статикой /recordings).
+    // Без него фронтенд получал undefined и видео не открывалось.
+    video_url: '/' + rec.video_path,
     date: dateStr,
     time: start.toISOString().slice(11, 19),
     duration: rec.duration,
     size_mb: rec.size_mb,
     video_path: rec.video_path,
+    person_name: "Видеозапись",
   };
   if (!recordingsData[rec.camera_id]) recordingsData[rec.camera_id] = {};
   if (!recordingsData[rec.camera_id][dateStr]) recordingsData[rec.camera_id][dateStr] = [];
@@ -2375,8 +2393,11 @@ function stopFileRecording(camId: number): boolean {
 // ── Сохранение снимков и событий распознавания (живой поток) ──────────────────
 const RECOGNIZED_DEBOUNCE_MS = 15_000;
 const UNKNOWN_DEBOUNCE_MS = 20_000;
+const UNKNOWN_PERSON_COOLDOWN_MS = 60_000;
 // cameraId:personKey -> последнее время события (чтобы не спамить БД)
 const lastEventAt = new Map<string, number>();
+// cameraId -> последнее время создания персоны из неизвестного (защита от дублей)
+const lastUnknownPersonAt = new Map<string, number>();
 
 function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: string): string {
   try {
@@ -2490,17 +2511,179 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
   triggerSmartRecording(cam);
 }
 
-async function handleUnknownEvent(cam: any, frameBase64: string) {
+/**
+ * Вырезает лицо из кадра по детектированному боксу с запасом по краям.
+ * Кадр с «крупным планом» лица даёт стабильный эмбеддинг (без ошибки
+ * «лицо не обнаружено»), в отличие от сохранения всего кадра целиком.
+ */
+async function cropFaceFromFrame(frameBase64: string, box: any): Promise<Buffer | null> {
+  try {
+    const buf = Buffer.from(frameBase64, "base64");
+    const meta = await sharp(buf).metadata();
+    const iw = meta.width || 640;
+    const ih = meta.height || 480;
+    const x = Math.round(box.x || 0);
+    const y = Math.round(box.y || 0);
+    const w = Math.round(box.width || 0);
+    const h = Math.round(box.height || 0);
+    if (w < 6 || h < 6) return null;
+    const padX = Math.round(w * 0.3);
+    const padY = Math.round(h * 0.3);
+    const left = Math.max(0, x - padX);
+    const top = Math.max(0, y - padY);
+    const right = Math.min(iw, x + w + padX);
+    const bottom = Math.min(ih, y + h + padY);
+    const cw = right - left;
+    const ch = bottom - top;
+    if (cw <= 0 || ch <= 0) return null;
+    return await sharp(buf)
+      .extract({ left, top, width: cw, height: ch })
+      .jpeg({ quality: 92 })
+      .toBuffer();
+  } catch (e) {
+    logError(e as Error, { context: "cropFaceFromFrame" });
+    return null;
+  }
+}
+
+/**
+ * Автоматически заносит неизвестного в базу людей: вырезает лицо из кадра,
+ * создаёт персону, регистрирует эмбеддинг. Если лицо уже есть в базе —
+ * просто привязывает событие к существующей персоне (дедуп).
+ */
+async function createUnknownPersonFromFace(
+  cam: any,
+  frameBase64: string,
+  face: any
+): Promise<{ id: number; name: string; category: string } | null> {
+  // Используем дескриптор, УЖЕ вычисленный детектором (face.descriptor) — он надёжен.
+  // Повторное вырезание лица + re-детект (старый код) проваливался на quality gate
+  // Python-сервера ("Лицо не обнаружено на фото"), поэтому эмбеддинг не сохранялся
+  // и персона была неопознаваемой → плодились дубликаты "Неизвестный".
+  const descriptorArr: number[] | null =
+    face?.descriptor && Array.isArray(face.descriptor) && face.descriptor.length
+      ? (face.descriptor as number[])
+      : null;
+
+  // Дедуп: не плодим дубликаты одного и того же лица (по уже готовому дескриптору)
+  if (descriptorArr && descriptorArr.length) {
+    try {
+      const existing = await searchByDescriptor(new Float32Array(descriptorArr), recognition_threshold_pct / 100, 1);
+      if (existing.length && existing[0].personId) {
+        const pid = existing[0].personId as number;
+        await prisma.person
+          .update({ where: { id: pid }, data: { visit_count: { increment: 1 }, last_seen_at: new Date() } })
+          .catch(() => {});
+        const p = persons.find((x: any) => x.id === pid);
+        return { id: pid, name: existing[0].personName, category: existing[0].category || (p?.category ?? "CLIENT") };
+      }
+    } catch (e) {
+      logDebug(`Дедуп неизвестного не удался: ${(e as Error).message}`);
+    }
+  }
+
+  // Сохраняем снимок лица для истории (обрезка по боксу, fallback — весь кадр)
+  let photoBuffer: Buffer | null = face?.box ? await cropFaceFromFrame(frameBase64, face.box) : null;
+  if (!photoBuffer) photoBuffer = Buffer.from(frameBase64, "base64");
+  const filename = `unknown_${cam.id}_${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
+  const fullPath = path.join(photosDir, filename);
+  // Асинхронная запись: функция вызывается из тика детекции (setInterval 500ms),
+  // синхронный writeFileSync блокировал бы event loop (разбор кадров и WS-рассылку).
+  await fs.promises.writeFile(fullPath, photoBuffer);
+  const photo_path = `photos/${filename}`;
+
+  const newPerson = await prisma.person.create({
+    data: {
+      name: "Неизвестный",
+      category: "CLIENT",
+      is_active: true,
+      visit_count: 1,
+      embedding_count: 0,
+    },
+  });
+
+  let hasEmbedding = false;
+  if (descriptorArr && descriptorArr.length) {
+    // Основной путь: регистрируем по уже вычисленному дескриптору
+    const reg = await registerPersonFromDescriptor(newPerson.id, "Неизвестный", "CLIENT", photo_path, descriptorArr);
+    hasEmbedding = reg.hasEmbedding;
+  } else {
+    // Fallback: пытаемся извлечь из обрезанного кадра (может не сработать на мелких лицах)
+    const reg = await registerFacePerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, fullPath);
+    hasEmbedding = reg.hasEmbedding;
+  }
+
+  await prisma.personPhoto.create({
+    data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: hasEmbedding },
+  });
+
+  await prisma.person.update({
+    where: { id: newPerson.id },
+    data: { photo_path, embedding_count: hasEmbedding ? 1 : 0 },
+  });
+
+  const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
+  if (created) persons.unshift({ ...created });
+
+  if (!hasEmbedding) {
+    // Без эмбеддинга персона бесполезна для распознавания и только засоряет БД → удаляем.
+    logWarn(`Не удалось получить эмбеддинг для неизвестного (ID ${newPerson.id}) — персона не создаётся`);
+    try {
+      await prisma.personPhoto.deleteMany({ where: { person_id: newPerson.id } });
+      await prisma.person.delete({ where: { id: newPerson.id } });
+      persons = persons.filter((x: any) => x.id !== newPerson.id);
+      if (fs.existsSync(fullPath)) await fs.promises.unlink(fullPath);
+    } catch (e) {
+      logError(e as Error, { context: "cleanup broken unknown person", personId: newPerson.id });
+    }
+    return null;
+  }
+
+  return { id: newPerson.id, name: "Неизвестный", category: "CLIENT" };
+}
+
+async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
   const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id);
-  recordVisitor(cam.id, null, "Неизвестный", snapshot_path);
+
+  let personId: number | null = null;
+  let personName: string | null = null;
+  let personCategory = "CLIENT";
+  let personPhotoPath: string | undefined;
+
+  if (auto_create_unknown_persons) {
+    const key = `${cam.id}:unknown-create`;
+    const now = Date.now();
+    if (now - (lastUnknownPersonAt.get(key) || 0) > UNKNOWN_PERSON_COOLDOWN_MS) {
+      try {
+        const created = await createUnknownPersonFromFace(cam, frameBase64, face);
+        if (created) {
+          personId = created.id;
+          personName = created.name;
+          personCategory = created.category;
+          lastUnknownPersonAt.set(key, now);
+          const p = persons.find((x: any) => x.id === created.id);
+          personPhotoPath = p?.photo_path;
+        }
+      } catch (e) {
+        logError(e as Error, { context: "auto-create unknown person" });
+      }
+    }
+  }
+
+  // Пишем посетителя в хронику ПОСЛЕ разрешения личности: если дедуп нашёл
+  // существующего человека, запись привяжется к нему, а не к абстрактному «Неизвестный».
+  recordVisitor(cam.id, personId, personName || "Неизвестный", snapshot_path);
+
   await persistAndBroadcastEvent({
     cameraId: cam.id,
     cameraName: cam.name,
+    personId,
     event_type: "UNKNOWN",
-    confidence: 0.5,
+    confidence: face?.score || 0.5,
     snapshot_path,
-    person_name: "Неизвестный",
-    person_category: "CLIENT",
+    person_name: personName || "Неизвестный",
+    person_category: personCategory,
+    person_photo_path: personPhotoPath,
   });
   triggerSmartRecording(cam);
 }
@@ -2552,7 +2735,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
       const key = `${cam.id}:unknown`;
       if (Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
-        await handleUnknownEvent(cam, frameBase64);
+        await handleUnknownEvent(cam, frameBase64, f);
       }
     }
   }
@@ -2566,6 +2749,10 @@ const activeFfmpegProcesses = new Map<number, ChildProcessWithoutNullStreams>();
 const cameraFrames = new Map<number, { frame: string; faces: any[] }>();
 // Единый таймер детекции/распознавания на камеру (запускается один раз, а не на каждого клиента)
 const cameraDetectionTimers = new Map<number, NodeJS.Timeout>();
+// Счётчик неудачных запусков FFmpeg на камеру (для экспоненциального backoff при недоступной камере)
+const cameraFfmpegRetries = new Map<number, number>();
+// Отложенные таймеры перезапуска FFmpeg (чтобы их можно было отменить при остановке пайплайна)
+const cameraRestartTimers = new Map<number, NodeJS.Timeout>();
 
 wssCamera.on("connection", (ws, req) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
@@ -2701,6 +2888,8 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         const shared = cameraFrames.get(cam.id) || { frame: fallbackFrame, faces: [] };
         shared.frame = jpeg.toString("base64");
         cameraFrames.set(cam.id, shared);
+        // Пошёл реальный поток — сбрасываем счётчик неудач, чтобы backoff обнулился
+        if (cameraFfmpegRetries.has(cam.id)) cameraFfmpegRetries.delete(cam.id);
         acc = acc.slice(e + 2);
         headerFound = false;
       }
@@ -2714,13 +2903,33 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
       logInfo(`FFmpeg завершил работу для камеры ${cam.id}, код: ${code}`);
       activeFfmpegProcesses.delete(cam.id);
       cameraFrames.delete(cam.id);
-      // Попробуем перезапустить через 3 сек
-      setTimeout(() => {
-        const currentCam = cameras.find(c => c.id === cam.id);
-        if (currentCam && currentCam.is_active && !activeFfmpegProcesses.has(cam.id)) {
-          startCameraPipeline(currentCam, fallbackFrame);
+
+      // Нет смысла перезапускать, если для камеры не осталось клиентов или она выключена
+      const currentCam = cameras.find(c => c.id === cam.id);
+      const hasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
+      if (!currentCam || !currentCam.is_active || !hasClients) {
+        cameraFfmpegRetries.delete(cam.id);
+        return;
+      }
+
+      // Экспоненциальный backoff: 3s → 6s → 12s → 24s → 30s (кап), чтобы не долбить недоступную камеру
+      const attempts = (cameraFfmpegRetries.get(cam.id) || 0) + 1;
+      cameraFfmpegRetries.set(cam.id, attempts);
+      const delay = Math.min(30000, 3000 * 2 ** Math.min(attempts - 1, 4));
+      // Логируем не каждую попытку, чтобы не засорять лог при долгой недоступности
+      if (attempts === 1 || attempts % 5 === 0) {
+        logWarn(`Камера ${cam.id} (${cam.name}) недоступна, попытка №${attempts}, следующий повтор через ${delay / 1000}с`);
+      }
+
+      const restartTimer = setTimeout(() => {
+        cameraRestartTimers.delete(cam.id);
+        const latestCam = cameras.find(c => c.id === cam.id);
+        const stillHasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
+        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(cam.id)) {
+          startCameraPipeline(latestCam, fallbackFrame);
         }
-      }, 3000);
+      }, delay);
+      cameraRestartTimers.set(cam.id, restartTimer);
     });
 
     startCameraDetection(cam, fallbackFrame);
@@ -2768,6 +2977,13 @@ function stopCameraPipeline(cameraId: number) {
     clearInterval(timer);
     cameraDetectionTimers.delete(cameraId);
   }
+  // Отменяем отложенный перезапуск и сбрасываем backoff-счётчик
+  const restartTimer = cameraRestartTimers.get(cameraId);
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    cameraRestartTimers.delete(cameraId);
+  }
+  cameraFfmpegRetries.delete(cameraId);
   cameraFrames.delete(cameraId);
 }
 
@@ -3160,6 +3376,51 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
   });
 });
 
+/**
+ * Освобождает порт перед запуском: завершает процесс, который его занимает.
+ * Это гарантирует чистый старт даже если остался висеть старый инстанс
+ * (например, упавший сервер или предыдущий запуск).
+ * Порт Python-движка (8001) отсюда НЕ освобождаем — его поднимает отдельный
+ * процесс (dev:face) параллельно через concurrently, и глушить его отсюда
+ * значило бы убить лицевой сервер на старте. Его освобождает скрипт kill-ports.js
+ * на этапе predev/prestart, до запуска всех процессов.
+ */
+async function freePort(port: number): Promise<void> {
+  const os = platform();
+  try {
+    if (os === "win32") {
+      const { stdout } = await execAsync(`netstat -ano | findstr :${port}`);
+      const pids = new Set<string>();
+      for (const line of stdout.split("\n")) {
+        if (!line.includes("LISTENING")) continue;
+        const parts = line.trim().split(/\s+/);
+        // parts[1] — локальный адрес (0.0.0.0:3000, [::]:3000). Сверяем порт ТОЧНО:
+        // findstr :3000 подстрочно матчит и :30000..:30009, иначе можно убить чужой процесс.
+        const localAddr = parts[1] || "";
+        if (!localAddr.endsWith(`:${port}`)) continue;
+        const pid = parts[parts.length - 1];
+        if (pid && /^\d+$/.test(pid)) pids.add(pid);
+      }
+      for (const pid of pids) {
+        try {
+          await execAsync(`taskkill /F /PID ${pid}`);
+          logWarn(`Освобождён порт ${port}: завершён процесс PID ${pid}`);
+        } catch {
+          // процесс уже ушёл
+        }
+      }
+    } else {
+      try {
+        await execAsync(`lsof -ti :${port} | xargs -r kill -9`);
+      } catch {
+        // нет процесса на порту
+      }
+    }
+  } catch {
+    // порт свободен или netstat недоступен — ничего не делаем
+  }
+}
+
 async function start() {
   // Инициализация базы данных
   await seedDatabase();
@@ -3185,28 +3446,12 @@ async function start() {
     logWarn("AI Face Engine не удалось инициализировать — работаем в mock-режиме");
   }
 
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-    // For SPA in dev mode, ensure index.html is sent for all non-api routes
-    app.get("*", async (req, res) => {
-      const url = req.originalUrl;
-      try {
-        const template = await fs.promises.readFile(
-          path.join(process.cwd(), "index.html"),
-          "utf-8"
-        );
-        const transformedHtml = await vite.transformIndexHtml(url, template);
-        res.status(200).set({ "Content-Type": "text/html" }).end(transformedHtml);
-      } catch (err) {
-        vite.ssrFixStacktrace(err as Error);
-        res.status(500).end((err as Error).message);
-      }
-    });
-  } else {
+  // В dev фронтенд (SPA + HMR) отдаётся автономным Vite на :5173 (см. vite.config.ts,
+  // который проксирует /api и /ws на :3000). Это стабильный HMR, независимый от
+  // event-loop бэкенда (FFmpeg/WebSocket), и исключает конфликт двух Vite-инстансов,
+  // из-за которого браузер постоянно перезагружался. Здесь на :3000 отдаём только
+  // статику собранного билда (продакшн).
+  if (process.env.NODE_ENV === "production") {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
@@ -3220,6 +3465,10 @@ async function start() {
   } else {
     logInfo("API-key аутентификация ВКЛЮЧЕНА (требуется на всех /api и /ws).");
   }
+
+  // Перед привязкой освобождаем порт от возможных «висячих» процессов,
+  // чтобы старт гарантированно прошёл (порт сперва убивается, потом запуск).
+  await freePort(PORT);
 
   server.listen(PORT, HOST, () => {
     logInfo(`Server running on http://${HOST}:${PORT}`);

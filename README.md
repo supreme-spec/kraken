@@ -65,7 +65,8 @@ npm run db:migrate
 npm run dev
 ```
 
-Открыть: [http://localhost:3000](http://localhost:3000)
+Открыть фронтенд (HMR): [http://localhost:5173](http://localhost:5173)
+Бэкенд API/WebSocket доступен на `http://localhost:3000` (проксируется Vite автоматически).
 
 ---
 

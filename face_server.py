@@ -28,10 +28,16 @@ from PIL import Image
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 FRAME_SKIP: int = int(os.getenv("FACE_FRAME_SKIP", "2"))
-MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "60"))
-MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.8"))
+# Пороги для ЖИВОЙ детекции (умеренные — баланс между полнотой и ложными срабатываниями)
+MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "40"))
+MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.6"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.55"))
+# Пороги для ИЗВЛЕЧЕНИЯ ЭМБЕДДИНГА (регистрация/обучение) — максимально мягкие:
+# здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
+EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
+EMBED_MIN_FACE_SIZE: int = int(os.getenv("FACE_EMBED_MIN_FACE_SIZE", "28"))
+ENABLE_PREPROCESS: bool = os.getenv("FACE_ENABLE_PREPROCESS", "1") not in ("0", "false", "False")
 API_KEY: str = os.getenv("FACE_API_KEY", "")
 DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
 
@@ -582,12 +588,13 @@ async def recognize_by_descriptor(
     Expected JSON body:
     {
       "descriptor": [float, float, ...],
-      "person_label": "optional_label_for_cooldown"
+        "person_label": "optional_label_for_cooldown"
     }
     """
-    if not should_process_frame():
-        return {"matches": [], "status": "skipped"}
-
+    # NOTE: намеренно НЕ вызываем should_process_frame() — дескриптор уже вычислен
+    # детектором, здесь только дешёвый FAISS-поиск. Frame-skip здесь приводил к тому,
+    # что половина вызовов возвращала status:"skipped" (пустые matches) → лицо
+    # ошибочно считалось "неизвестным" и плодило дубликаты персон.
     try:
         descriptor_raw = payload.get("descriptor")
         if not descriptor_raw:

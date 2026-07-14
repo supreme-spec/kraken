@@ -10,6 +10,7 @@
     "dev:face": ".\\venv\\Scripts\\python.exe face_server.py",
     "dev:vite": "vite",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.mjs",
+    "prestart": "node kill-ports.js",
     "start": "NODE_ENV=production node dist/server.mjs",
     "clean": "Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue",
     "lint": "tsc --noEmit --skipLibCheck",

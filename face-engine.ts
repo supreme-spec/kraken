@@ -258,7 +258,7 @@ async function saveDescriptorToDB(
   category: string,
   photoPath: string,
   descriptor: Float32Array
-): Promise<void> {
+): Promise<boolean> {
   try {
     // Пробуем бинарный формат, fallback на JSON при ошибке
     try {
@@ -290,8 +290,10 @@ async function saveDescriptorToDB(
         throw binaryErr;
       }
     }
+    return true;
   } catch (err) {
     logError(err as Error, { context: "Сохранение дескриптора в БД", personId, personName, photoPath });
+    return false;
   }
 }
 
@@ -856,6 +858,65 @@ export async function registerPerson(
     return { success: true, hasEmbedding: true };
   } catch (err) {
     logError(err as Error, { context: "Регистрация", personId, personName });
+    return { success: false, hasEmbedding: false, error: (err as any).message };
+  }
+}
+
+export async function registerPersonFromDescriptor(
+  personId: number,
+  personName: string,
+  category: string,
+  photoPath: string,
+  descriptor: Float32Array | number[]
+): Promise<{ success: boolean; hasEmbedding: boolean; error?: string }> {
+  try {
+    const desc = descriptor instanceof Float32Array ? descriptor : new Float32Array(descriptor);
+
+    if (!desc || desc.length === 0) {
+      return { success: false, hasEmbedding: false, error: "Пустой дескриптор" };
+    }
+
+    // Удаляем старый дескриптор с тем же фото
+    const existingIdx = storedDescriptors.findIndex(
+      (d) => d.personId === personId && d.photoPath === photoPath
+    );
+    if (existingIdx >= 0) {
+      storedDescriptors.splice(existingIdx, 1);
+    }
+
+    // Добавляем новый дескриптор
+    storedDescriptors.push({
+      personId,
+      personName,
+      category,
+      photoPath,
+      descriptor: desc,
+      descriptorList: Array.from(desc),
+    });
+
+    // Сохраняем в БД (бинарный формат с fallback на JSON)
+    const saved = await saveDescriptorToDB(personId, personName, category, photoPath, desc);
+    if (!saved) {
+      // Запись в БД не удалась → откатываем in-memory push, чтобы не держать дескриптор,
+      // которого нет в БД, и честно сообщаем вызывающему (тот удалит неполную персону).
+      const idx = storedDescriptors.findIndex(
+        (d) => d.personId === personId && d.photoPath === photoPath
+      );
+      if (idx >= 0) storedDescriptors.splice(idx, 1);
+      return { success: false, hasEmbedding: false, error: "Не удалось сохранить дескриптор в БД" };
+    }
+
+    logDebug(`Зарегистрирован дескриптор для "${personName}" (ID: ${personId})`);
+
+    // Синхронизируем FAISS-индекс (если Python-сервер недоступен — не падаем,
+    // дескриптор уже сохранён в БД и in-memory; индекс обновится при следующей синхронизации)
+    await syncIndexWithPython().catch((e) =>
+      logWarn("FAISS sync skipped (Python недоступен)", { error: (e as Error).message })
+    );
+
+    return { success: true, hasEmbedding: true };
+  } catch (err) {
+    logError(err as Error, { context: "Регистрация по дескриптору", personId, personName });
     return { success: false, hasEmbedding: false, error: (err as any).message };
   }
 }

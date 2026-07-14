@@ -95,8 +95,8 @@ export default function TopBar({
         </div>
       </div>
 
-      {/* Center: slogan */}
-      <div className="hidden lg:flex absolute left-[38%] -translate-x-1/2 flex-col items-center leading-none select-none pointer-events-none gap-0.5">
+      {/* Center: slogan — только на компьютере (с мышью), не на телефоне/планшете */}
+      <div className="slogan-desktop-only absolute left-[38%] -translate-x-1/2 flex-col items-center leading-none select-none pointer-events-none gap-0.5">
         <span className="text-kraken-muted text-[9px] tracking-[0.18em] uppercase font-medium">
           Невидимое управляет хаосом.
         </span>

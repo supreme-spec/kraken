@@ -14,8 +14,17 @@ backups/
 # База данных (runtime-данные, не коммитим)
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 prisma/*.db
 prisma/*.db-journal
+prisma/*.db-shm
+prisma/*.db-wal
+
+# Рантайм-медиа, создаваемые конвейером камер (не коммитим)
+public/photos/unknown_*
+public/recordings/
+public/snapshots/cam*
 
 /src/generated/prisma
 

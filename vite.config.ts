@@ -15,7 +15,10 @@ export default defineConfig(() => {
 
     server: {
       hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      watch: process.env.DISABLE_HMR === 'true' ? null : {
+        // Игнорируем постоянно меняющиеся логи/билды, чтобы не дёргать HMR лишний раз
+        ignored: ['**/logs/**', '**/node_modules/**', '**/.git/**', '**/dist/**'],
+      },
       proxy: {
         '/api': {
           target: 'http://localhost:3000',
