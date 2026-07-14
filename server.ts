@@ -196,7 +196,7 @@ const DEFAULT_TAG_TYPES = {
 
 // ── SETTINGS STATE (синхронизируются с БД через Settings table) ──
 let active_categories: string[] = ["BLACKLIST", "RESPONSE", "VIP"];
-let recognition_threshold_pct = 55;
+let recognition_threshold_pct = 45;
 let verification_threshold_pct = 60;
 let embedding_cache_enabled = true;
 let embedding_cache_ttl_days = 30;
@@ -988,7 +988,7 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
       const photo_path = `photos/${f.filename}`;
       const fullPath = path.join(publicDir, photo_path);
 
-      const regResult = await registerFacePerson(newPerson.id, name, category, photo_path, fullPath);
+      const regResult = await enrollPhotoWithGate(newPerson.id, name, category, photo_path, fullPath);
 
       const personPhoto = await prisma.personPhoto.create({
         data: {
