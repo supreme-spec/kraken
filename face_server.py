@@ -247,17 +247,6 @@ def load_descriptors_from_sqlite(db_path: str = DB_PATH) -> List[Dict[str, Any]]
         return []
 
 
-if is_initialized:
-    try:
-        initial_descriptors = load_descriptors_from_sqlite()
-        if initial_descriptors:
-            _build_faiss_index(initial_descriptors)
-        else:
-            logger.info("No descriptors found in DB. FAISS index is empty.")
-    except Exception as e:
-        logger.error(f"Auto-index build failed: {e}")
-
-
 # ─── FAISS Helpers ────────────────────────────────────────────────────────────
 
 def _build_faiss_index(descriptors: List[Dict[str, Any]]) -> None:
@@ -321,6 +310,19 @@ def get_faiss_matches(query_vector: np.ndarray, top_k: int = 5) -> List[Dict[str
             "person": faiss_index_id_to_person[idx],
         })
     return results
+
+
+# Авто-загрузка FAISS-индекса при старте. Блок расположен ПОСЛЕ определения
+# _build_faiss_index / get_faiss_matches, иначе NameError при is_initialized=True.
+if is_initialized:
+    try:
+        initial_descriptors = load_descriptors_from_sqlite()
+        if initial_descriptors:
+            _build_faiss_index(initial_descriptors)
+        else:
+            logger.info("No descriptors found in DB. FAISS index is empty.")
+    except Exception as e:
+        logger.error(f"Auto-index build failed: {e}")
 
 
 # ─── Image Helpers ────────────────────────────────────────────────────────────
