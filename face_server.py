@@ -867,8 +867,12 @@ async def recognize(
             if sim > best_sim:
                 best_sim = sim
 
+            # Не отбрасываем кандидата с ВЫСОКИМ сходством из-за несовпадения
+            # категории: такой кандидат должен попасть к оператору на подтверждение
+            # (серая зона / авто-распознавание), а не молча уходить в unknown.
             if category and person.get("category") != category:
-                continue
+                if sim < LOW_THRESHOLD:
+                    continue
 
             if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
                 needs_confirmation_data = {
@@ -959,8 +963,12 @@ async def recognize_by_descriptor(
             if sim > best_sim:
                 best_sim = sim
 
+            # Не отбрасываем кандидата с ВЫСОКИМ сходством из-за несовпадения
+            # категории: такой кандидат должен попасть к оператору на подтверждение
+            # (серая зона / авто-распознавание), а не молча уходить в unknown.
             if category and person.get("category") != category:
-                continue
+                if sim < LOW_THRESHOLD:
+                    continue
 
             if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
                 needs_confirmation_data = {
