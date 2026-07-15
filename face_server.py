@@ -33,9 +33,11 @@ FRAME_SKIP: int = int(os.getenv("FACE_FRAME_SKIP", "2"))
 MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "40"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.6"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
-RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.45"))
-CONFIRMATION_THRESHOLD: float = float(os.getenv("FACE_CONFIRMATION_THRESHOLD", "0.55"))
-LOW_THRESHOLD: float = float(os.getenv("FACE_LOW_THRESHOLD", "0.40"))
+# .env хранит пороги в процентах (0-100), см. .env.example.
+# Косинусное сходство FAISS лежит в диапазоне [-1, 1], поэтому переводим в доли.
+RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "45")) / 100
+CONFIRMATION_THRESHOLD: float = float(os.getenv("FACE_CONFIRMATION_THRESHOLD", "55")) / 100
+LOW_THRESHOLD: float = float(os.getenv("FACE_LOW_THRESHOLD", "40")) / 100
 # Пороги для ИЗВЛЕЧЕНИЯ ЭМБЕДДИНГА (регистрация/обучение) — максимально мягкие:
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
