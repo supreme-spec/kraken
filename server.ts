@@ -3139,6 +3139,21 @@ async function createUnknownPersonFromFace(
 }
 
 async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
+  if (face && face.descriptor && Array.isArray(face.descriptor)) {
+    try {
+      const faceHash = require('crypto')
+        .createHash('md5')
+        .update(JSON.stringify(face.descriptor.slice(0, 10)))
+        .digest('hex');
+      const lastSeen = unknownFaceCooldowns.get(faceHash);
+      if (lastSeen && (Date.now() - lastSeen) < UNKNOWN_COOLDOWN_MS) {
+        logDebug(`[Камера ${cam.id}] Дубликат неизвестного лица (хэш ${faceHash.slice(0, 8)}), пропуск события`);
+        return;
+      }
+      unknownFaceCooldowns.set(faceHash, Date.now());
+    } catch { /* ignore hash errors */ }
+  }
+
   const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id);
 
   let personId: number | undefined = undefined;
