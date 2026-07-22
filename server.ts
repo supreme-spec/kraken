@@ -3437,14 +3437,14 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
     const proc = spawn(ffmpegPath, args);
     activeFfmpegProcesses.set(cam.id, proc);
     // Эффективный разбор MJPEG: один растущий буфер + indexOf (без побайтовых аллокаций)
-    let acc = Buffer.alloc(0);
+    let acc: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let headerFound = false;
 
     proc.stdout.on("data", (chunk: Buffer) => {
       if (acc.length) {
         acc = Buffer.concat([acc, chunk]);
       } else {
-        acc = chunk;
+        acc = chunk as Buffer<ArrayBufferLike>;
       }
 
       // Ограничиваем размер буфера, чтобы не съесть память при сбоях потока
