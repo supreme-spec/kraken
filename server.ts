@@ -3315,6 +3315,7 @@ const activeFfmpegProcesses = new Map<number, ChildProcessWithoutNullStreams>();
 const cameraFrames = new Map<number, { frame: string; faces: any[] }>();
 // Единый таймер детекции/распознавания на камеру (запускается один раз, а не на каждого клиента)
 const cameraDetectionTimers = new Map<number, NodeJS.Timeout>();
+const cameraLastFrameHash = new Map<number, string>();
 // Счётчик неудачных запусков FFmpeg на камеру (для экспоненциального backoff при недоступной камере)
 const cameraFfmpegRetries = new Map<number, number>();
 const cameraFfmpegFailCount = new Map<number, number>();
@@ -3558,16 +3559,64 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
 
 function startCameraDetection(cam: any, fallbackFrame: string) {
   if (cameraDetectionTimers.has(cam.id)) return;
-  let detectionInProgress = false;
 
-  const timer = setInterval(async () => {
+  let detectionInProgress = false;
+  let currentInterval = 1000;
+  let consecutiveSuccesses = 0;
+  let consecutiveFailures = 0;
+  let lastDetectionTime = 0;
+
+  const minInterval = 500;
+  const maxInterval = 3000;
+
+  function getAdjustedInterval(base: number): number {
+    const priority = camera_priority_weights[cam.id] || camera_priority_weights[cam.camera_type] || 1.0;
+    if (priority <= 0) return maxInterval;
+    return Math.max(minInterval, Math.round(base / priority));
+  }
+
+  function shouldRunBySchedule(): boolean {
+    if (!ai_adaptive_frame_skip) return true;
+    const hour = new Date().getHours();
+    const camSchedule = cam.schedule || "always";
+    if (camSchedule === "night") {
+      return hour >= 0 && hour < 6;
+    } else if (camSchedule === "day") {
+      return hour >= 6 && hour < 22;
+    } else if (camSchedule === "always") {
+      if (hour >= 0 && hour < 6) {
+        return Math.random() > 0.7;
+      }
+    }
+    return true;
+  }
+
+  function hasMotion(frameBase64: string): boolean {
+    if (!ai_adaptive_frame_skip) return true;
+    const hash = Buffer.from(frameBase64).toString("base64").slice(0, 64);
+    const prev = cameraLastFrameHash.get(cam.id);
+    cameraLastFrameHash.set(cam.id, hash);
+    if (!prev) return true;
+    return hash !== prev;
+  }
+
+  async function runDetection() {
     if (!activeFfmpegProcesses.has(cam.id)) return;
+
     const shared = cameraFrames.get(cam.id);
     const frameBase64 = shared ? shared.frame : fallbackFrame;
-    if (!frameBase64 || frameBase64 === fallbackFrame) return; // реального кадра ещё нет
-    if (detectionInProgress) return;
+    if (!frameBase64 || frameBase64 === fallbackFrame) return;
+
+    if (!hasMotion(frameBase64)) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastDetectionTime < currentInterval) return;
 
     detectionInProgress = true;
+    const startTime = Date.now();
+
     try {
       const buf = Buffer.from(frameBase64, "base64");
       const faces = await detectFaces(buf);
@@ -3575,11 +3624,32 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
       const cur = cameraFrames.get(cam.id) || { frame: frameBase64, faces: [] };
       cur.faces = enriched;
       cameraFrames.set(cam.id, cur);
+
+      const duration = Date.now() - startTime;
+      consecutiveSuccesses++;
+      consecutiveFailures = 0;
+      lastDetectionTime = now;
+
+      if (duration < 200 && consecutiveSuccesses >= 10 && currentInterval > minInterval) {
+        currentInterval = getAdjustedInterval(Math.max(minInterval, currentInterval - 100));
+      }
     } catch (e) {
       logError(e as Error, { cameraId: cam.id });
+      consecutiveFailures++;
+      consecutiveSuccesses = 0;
+
+      if (consecutiveFailures >= 2 && currentInterval < maxInterval) {
+        currentInterval = getAdjustedInterval(Math.min(maxInterval, currentInterval + 500));
+      }
     } finally {
       detectionInProgress = false;
     }
+  }
+
+  const timer = setInterval(async () => {
+    if (!activeFfmpegProcesses.has(cam.id)) return;
+    if (!shouldRunBySchedule()) return;
+    await runDetection();
   }, 500);
 
   cameraDetectionTimers.set(cam.id, timer);
@@ -3604,6 +3674,7 @@ function stopCameraPipeline(cameraId: number) {
   }
   cameraFfmpegRetries.delete(cameraId);
   cameraFrames.delete(cameraId);
+  cameraLastFrameHash.delete(cameraId);
 }
 
 // Upgrade handling for websockets
