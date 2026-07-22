@@ -3363,8 +3363,8 @@ function getStreamResolution(cam: any): { width: number; height: number } {
     return { width: 640, height: 480 };
   }
   const key = cam.camera_type || "RTSP";
-  const w = parseInt(process.env[`${key}_STREAM_WIDTH`] || process.env["STREAM_WIDTH"] || "1920", 10);
-  const h = parseInt(process.env[`${key}_STREAM_HEIGHT`] || process.env["STREAM_HEIGHT"] || "1080", 10);
+  const w = parseInt(process.env[`${key}_STREAM_WIDTH`] || process.env["STREAM_WIDTH"] || "2560", 10);
+  const h = parseInt(process.env[`${key}_STREAM_HEIGHT`] || process.env["STREAM_HEIGHT"] || "1440", 10);
   return { width: w, height: h };
 }
 
@@ -3385,13 +3385,12 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
     "-s", `${width}x${height}`,
     "-"
   ];
+  logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name}) @ ${width}x${height}`, { source: cam.source, path: getFfmpegPath() });
 
   try {
     const ffmpegPath = getFfmpegPath();
     const proc = spawn(ffmpegPath, args);
     activeFfmpegProcesses.set(cam.id, proc);
-    logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name})`, { source: cam.source, path: ffmpegPath });
-
     // Эффективный разбор MJPEG: один растущий буфер + indexOf (без побайтовых аллокаций)
     let acc = Buffer.alloc(0);
     let headerFound = false;
