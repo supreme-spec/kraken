@@ -65,6 +65,12 @@ const HOST = process.env.HOST || "0.0.0.0";
 // Опциональный API-ключ. Если задан — сервер требует его на всех /api и /ws.
 // Если не задан — сервер работает открыто (dev), но выводит предупреждение.
 const API_KEY = process.env.API_KEY || "";
+const DEBUG_CAMERA_IDS = new Set(
+  (process.env.DEBUG_CAMERA_IDS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
 
 app.use(express.json());
 
@@ -218,13 +224,10 @@ const ALLOWED_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "im
 const upload = multer({
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10 МБ
-    files: 500, // Максимум 500 файлов за один запрос
+    fileSize: 10 * 1024 * 1024,
+    files: 500,
   },
-}).fields([
-  { name: 'photos', maxCount: 500 }, // Файлы фото
-  { name: 'category', maxCount: 1 },  // Текстовое поле категории
-]);
+});
 
 // Multer error middleware — перехватывает ошибки multer ДО стандартного error handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -3287,15 +3290,15 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
 }
 
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
-async function processDetectedFaces(cam: any, frameBase64: string, faces: any[]): Promise<any[]> {
-  const roiZones = parseRoiZones(cam);
-  const filtered = filterFacesByRoi(faces, roiZones);
-  if (roiZones.length && filtered.length < faces.length) {
+async function processDetectedFaces(cam: any, frameBase64: string, faces: any[], debug = false): Promise<any[]> {
+  const roiZones = debug ? [] : parseRoiZones(cam);
+  const filtered = debug ? faces : filterFacesByRoi(faces, roiZones);
+  if (!debug && roiZones.length && filtered.length < faces.length) {
     logDebug(`ROI filter camera ${cam.id}: ${faces.length} faces → ${filtered.length} inside zones`);
   }
 
-  const minThreshold = Math.max(low_threshold_pct, recognition_threshold_pct) / 100;
-  const confirmT = confirmation_threshold_pct / 100;
+  const minThreshold = debug ? 0.05 : Math.max(low_threshold_pct, recognition_threshold_pct) / 100;
+  const confirmT = debug ? 0.10 : confirmation_threshold_pct / 100;
   const enriched: any[] = [];
   for (let i = 0; i < filtered.length; i++) {
     const f = filtered[i];
@@ -3306,7 +3309,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     const h = box.height || 0;
     const bbox: [number, number, number, number] = [x, y, x + w, y + h];
 
-    if (h < VISIT_MIN_FACE_SIZE_PX) continue;
+    if (!debug && h < VISIT_MIN_FACE_SIZE_PX) continue;
 
     const desc = f.descriptor;
 
@@ -3332,7 +3335,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         continue;
       }
 
-      if (isPersonInCurrentVisitWindow(match.personId)) {
+      if (!debug && isPersonInCurrentVisitWindow(match.personId)) {
         enriched.push({
           track_id: i + 1,
           bbox,
@@ -3384,15 +3387,14 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         needs_confirmation: true,
       });
       const key = `${cam.id}:conf${match.personId}`;
-      if (Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
+      if (debug || Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
         await handleConfirmationEvent(cam, match, frameBase64, f);
       }
     } else {
       const faceHash = Buffer.from(JSON.stringify(f.descriptor || [])).toString("base64").slice(0, 64);
-      const unknownCooldown = unknownFaceCooldowns.get(faceHash);
       const now = Date.now();
-      if (unknownCooldown && now - unknownCooldown < UNKNOWN_COOLDOWN_MS) {
+      if (!debug && unknownFaceCooldowns.has(faceHash) && now - (unknownFaceCooldowns.get(faceHash) || 0) < UNKNOWN_COOLDOWN_MS) {
         enriched.push({
           track_id: i + 1,
           bbox,
@@ -3416,7 +3418,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         box: f.box,
       });
       const key = `${cam.id}:unknown`;
-      if (Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
+      if (debug || Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
         unknownFaceCooldowns.set(faceHash, now);
         await handleUnknownEvent(cam, frameBase64, f);
@@ -3865,7 +3867,9 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
     try {
       const buf = Buffer.from(frameBase64, "base64");
       const faces = await detectFaces(buf);
-      const enriched = await processDetectedFaces(cam, frameBase64, faces);
+      const debug = DEBUG_CAMERA_IDS.has(String(cam.id));
+      if (debug) logWarn(`DEBUG MODE включён для камеры ${cam.id}: ROI отключён, пороги снижены, кулдауны отключены`);
+      const enriched = await processDetectedFaces(cam, frameBase64, faces, debug);
       const cur = cameraFrames.get(cam.id) || { frame: frameBase64, faces: [] };
       cur.faces = enriched;
       cameraFrames.set(cam.id, cur);
@@ -4249,6 +4253,48 @@ app.post(["/api/face-engine/quality", "/api/face-engine/quality/"], upload.any()
     const filePath = path.join(photosDir, files[0].filename);
     const quality = await assessPhotoQuality(filePath);
     res.json(quality);
+  } catch (err: any) {
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// Debug: детекция/распознавание на uploaded-файле с обходом ROI и низкими порогами
+app.post(["/api/debug/detect", "/api/debug/detect/"], upload.any(), async (req, res) => {
+  let files: Express.Multer.File[] = [];
+  if (req.file) files.push(req.file);
+  if (req.files && Array.isArray(req.files)) files = files.concat(req.files as Express.Multer.File[]);
+
+  if (files.length === 0) {
+    return res.status(400).json({ detail: "No file uploaded" });
+  }
+
+  try {
+    const filePath = path.join(photosDir, files[0].filename);
+    const faces = await detectFaces(filePath);
+
+    const enriched = await processDetectedFaces(
+      { id: 0, name: "DEBUG", roi_zones: null } as any,
+      "",
+      faces,
+      true
+    );
+
+    res.json({
+      face_count: faces.length,
+      faces: enriched.map((f: any) => ({
+        box: f.box,
+        score: f.detection_score || f.score,
+        descriptor_hash: !!f.descriptor,
+        person_id: f.person_id,
+        person_name: f.person_name,
+        category: f.category,
+        confidence: f.confidence,
+        needs_confirmation: f.needs_confirmation,
+        is_cooldown: f.is_cooldown,
+        is_duplicate_unknown: f.is_duplicate_unknown,
+        is_ignored: f.is_ignored,
+      })),
+    });
   } catch (err: any) {
     res.status(500).json({ detail: err.message });
   }

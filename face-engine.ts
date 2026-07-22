@@ -776,7 +776,7 @@ async function recognizeDescriptorOnServer(
   }
 }
 
-async function syncIndexWithPython(): Promise<void> {
+export async function syncIndexWithPython(): Promise<void> {
   try {
     const persons = storedDescriptors.map((d) => ({
       person_id: d.personId,
@@ -1112,7 +1112,7 @@ export async function addEmbeddingToPerson(
   }
 }
 
-export async function unregisterPerson(personId: number): Promise<void> {
+export async function unregisterPerson(personId: number, skipSync = false): Promise<void> {
   const before = storedDescriptors.length;
   let i = storedDescriptors.length;
   while (i--) {
@@ -1129,7 +1129,9 @@ export async function unregisterPerson(personId: number): Promise<void> {
   }
   logDebug(`Удалено ${before - storedDescriptors.length} дескрипторов персоны ID: ${personId}`);
 
-  await syncIndexWithPython();
+  if (!skipSync) {
+    await syncIndexWithPython();
+  }
 }
 
 /**

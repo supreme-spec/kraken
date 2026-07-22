@@ -2,8 +2,8 @@ fastapi==0.139.2
 uvicorn==0.51.0
 python-multipart==0.0.32
 insightface==1.0.1
-# CPU-only ONNX Runtime. For AMD/Intel GPU on Windows, replace with:
-# onnxruntime-directml==1.20.1
+# Для CUDA GPU замените CPU-версию на GPU-версию:
+# onnxruntime-gpu==1.20.1
 onnxruntime==1.20.1
 numpy==1.26.4
 ml_dtypes==0.5.4
