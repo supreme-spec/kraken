@@ -132,6 +132,38 @@ function initDirectories() {
 }
 initDirectories();
 
+function parseRoiZones(cam: any): any[] {
+  try {
+    if (!cam.roi_zones) return [];
+    const parsed = JSON.parse(cam.roi_zones);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function isPointInRoi(x: number, y: number, zones: any[]): boolean {
+  if (!zones.length) return true;
+  for (const zone of zones) {
+    const x1 = Number(zone.x1 ?? zone.x ?? 0);
+    const y1 = Number(zone.y1 ?? zone.y ?? 0);
+    const x2 = Number(zone.x2 ?? zone.x + zone.width ?? 0);
+    const y2 = Number(zone.y2 ?? zone.y + zone.height ?? 0);
+    if (x >= x1 && x <= x2 && y >= y1 && y <= y2) return true;
+  }
+  return false;
+}
+
+function filterFacesByRoi(faces: any[], roiZones: any[]): any[] {
+  if (!roiZones.length) return faces;
+  return faces.filter((f) => {
+    const box = f.box || {};
+    const cx = (box.x || 0) + (box.width || 0) / 2;
+    const cy = (box.y || 0) + (box.height || 0) / 2;
+    return isPointInRoi(cx, cy, roiZones);
+  });
+}
+
 // Serve the uploaded photos, snapshots, and recordings statically with API-key protection
 app.use("/photos", apiKeyAuth, express.static(photosDir));
 app.use("/snapshots", apiKeyAuth, express.static(snapshotsDir));
@@ -2715,9 +2747,10 @@ async function startFileRecording(cam: any, durationSec?: number): Promise<strin
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const outputPath = path.join(recordingsDir, `cam${cam.id}_${ts}.mp4`);
     const args = [...buildFfmpegInputArgs(cam)];
+    const { width, height } = getStreamResolution(cam);
     args.push("-y");
     if (durationSec) args.push("-t", String(durationSec));
-    args.push("-r", "10", "-s", "640x480", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-movflags", "+faststart", outputPath);
+    args.push("-r", "10", "-s", `${width}x${height}`, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-movflags", "+faststart", outputPath);
 
     logInfo(`FFmpeg запись старт для камеры ${cam.id} (${cam.name}) → ${outputPath}`, { durationSec });
     const proc = spawn(ffmpegPath, args);
@@ -3073,11 +3106,17 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
 
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
 async function processDetectedFaces(cam: any, frameBase64: string, faces: any[]): Promise<any[]> {
+  const roiZones = parseRoiZones(cam);
+  const filtered = filterFacesByRoi(faces, roiZones);
+  if (roiZones.length && filtered.length < faces.length) {
+    logDebug(`ROI filter camera ${cam.id}: ${faces.length} faces → ${filtered.length} inside zones`);
+  }
+
   const minThreshold = Math.max(low_threshold_pct, recognition_threshold_pct) / 100;
   const confirmT = confirmation_threshold_pct / 100;
   const enriched: any[] = [];
-  for (let i = 0; i < faces.length; i++) {
-    const f = faces[i];
+  for (let i = 0; i < filtered.length; i++) {
+    const f = filtered[i];
     const box = f.box || {};
     const x = box.x || 0;
     const y = box.y || 0;
@@ -3256,7 +3295,7 @@ wssCamera.on("connection", (ws, req) => {
   const fallbackFrame = getFallbackFrame();
 
   // Запускаем FFmpeg + детекцию, если это первый клиент для этой камеры
-  if (!activeFfmpegProcesses.has(cameraId)) {
+  if (!activeFfmpegProcesses.has(cameraId) && !initialCam.use_camera_analytics) {
     startCameraPipeline(initialCam, fallbackFrame);
   }
 
@@ -3318,16 +3357,32 @@ function getFallbackFrame(): string {
   return FALLBACK_JPEG;
 }
 
+function getStreamResolution(cam: any): { width: number; height: number } {
+  const isIp = cam.camera_type === "Hikvision" || cam.camera_type === "UNV" || cam.camera_type === "ONVIF" || cam.camera_type === "RTSP" || cam.camera_type === "IP";
+  if (!isIp) {
+    return { width: 640, height: 480 };
+  }
+  const key = cam.camera_type || "RTSP";
+  const w = parseInt(process.env[`${key}_STREAM_WIDTH`] || process.env["STREAM_WIDTH"] || "1920", 10);
+  const h = parseInt(process.env[`${key}_STREAM_HEIGHT`] || process.env["STREAM_HEIGHT"] || "1080", 10);
+  return { width: w, height: h };
+}
+
 function startCameraPipeline(cam: any, fallbackFrame: string) {
   if (!cam.source) return;
+  if (cam.use_camera_analytics) {
+    logInfo(`Камера ${cam.id} (${cam.name}) использует встроенную аналитику — FFmpeg/детекция не запускаются`);
+    return;
+  }
 
+  const { width, height } = getStreamResolution(cam);
   const args = [
     ...buildFfmpegInputArgs(cam),
     "-f", "mjpeg",
     "-pix_fmt", "yuvj422p",
     "-q:v", "3",
     "-r", "10",
-    "-s", "640x480",
+    "-s", `${width}x${height}`,
     "-"
   ];
 
@@ -3418,7 +3473,7 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
       const restartTimer = setTimeout(() => {
         cameraRestartTimers.delete(cam.id);
         const latestCam = cameras.find(c => c.id === cam.id);
-        if (latestCam && latestCam.is_active && !activeFfmpegProcesses.has(cam.id)) {
+        if (latestCam && latestCam.is_active && !latestCam.use_camera_analytics && !activeFfmpegProcesses.has(cam.id)) {
           startCameraPipeline(latestCam, fallbackFrame);
         }
       }, delay);
@@ -4008,7 +4063,7 @@ async function seedDatabase() {
   // сразу после старта сервера, без ожидания WebSocket-клиента в браузере.
   const fallbackFrame = getFallbackFrame();
   for (const cam of cameras) {
-    if (cam.is_active && !activeFfmpegProcesses.has(cam.id)) {
+    if (cam.is_active && !activeFfmpegProcesses.has(cam.id) && !cam.use_camera_analytics) {
       try {
         startCameraPipeline(cam, fallbackFrame);
         logInfo(`Автозапуск камеры ${cam.id} (${cam.name}) при старте сервера`);

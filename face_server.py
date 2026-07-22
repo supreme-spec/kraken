@@ -31,6 +31,7 @@ from PIL import Image
 FRAME_SKIP: int = int(os.getenv("FACE_FRAME_SKIP", "2"))
 # Пороги для ЖИВОЙ детекции (умеренные — баланс между полнотой и ложными срабатываниями)
 MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "40"))
+MAX_FACE_SIZE: int = int(os.getenv("FACE_MAX_FACE_SIZE", "0"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.6"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 # .env хранит пороги в процентах (0-100), см. .env.example.
@@ -342,6 +343,7 @@ def passes_quality_gate(face: Any) -> bool:
     Rejects:
       - det_score < MIN_DETECTION_SCORE
       - face width < MIN_FACE_SIZE
+      - face width > MAX_FACE_SIZE (when enabled)
     """
     score = float(face.det_score) if hasattr(face, "det_score") else 0.0
     if score < MIN_DETECTION_SCORE:
@@ -352,6 +354,10 @@ def passes_quality_gate(face: Any) -> bool:
     width = int(bbox[2] - bbox[0])
     if width < MIN_FACE_SIZE:
         logger.debug(f"Quality gate: width {width} < {MIN_FACE_SIZE}")
+        return False
+
+    if MAX_FACE_SIZE > 0 and width > MAX_FACE_SIZE:
+        logger.debug(f"Quality gate: width {width} > MAX_FACE_SIZE {MAX_FACE_SIZE}")
         return False
 
     return True
@@ -589,6 +595,7 @@ async def get_status() -> Dict[str, Any]:
         "frame_skip": FRAME_SKIP,
         "min_det_score": MIN_DETECTION_SCORE,
         "min_face_size": MIN_FACE_SIZE,
+        "max_face_size": MAX_FACE_SIZE if MAX_FACE_SIZE > 0 else None,
         "cooldown_seconds": COOLDOWN_SECONDS,
         "recognition_threshold": RECOGNITION_THRESHOLD,
         "enroll_sharpness_min": ENROLL_SHARPNESS_SCORE_MIN,
