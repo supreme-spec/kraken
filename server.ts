@@ -3441,7 +3441,11 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
     let headerFound = false;
 
     proc.stdout.on("data", (chunk: Buffer) => {
-      acc = acc.length ? Buffer.concat([acc, chunk]) : (chunk as Buffer);
+      if (acc.length) {
+        acc = Buffer.concat([acc, chunk]);
+      } else {
+        acc = chunk;
+      }
 
       // Ограничиваем размер буфера, чтобы не съесть память при сбоях потока
       if (acc.length > 8 * 1024 * 1024) acc = acc.slice(acc.length - 64);
