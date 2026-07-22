@@ -25,6 +25,9 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
