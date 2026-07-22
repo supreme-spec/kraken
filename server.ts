@@ -63,15 +63,37 @@ app.use(express.json());
 // Middleware для логирования запросов
 app.use((req, res, next) => {
   const start = Date.now();
-  logInfo(`${req.method} ${req.url}`, { ip: req.ip });
+  const sensitiveParams = ["api_key", "password", "token", "secret", "Authorization"];
+  let logUrl = req.url;
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    sensitiveParams.forEach(param => {
+      if (url.searchParams.has(param)) {
+        url.searchParams.set(param, "[REDACTED]");
+      }
+    });
+    logUrl = url.pathname + url.search;
+  } catch {
+    const lower = req.url.toLowerCase();
+    sensitiveParams.forEach(param => {
+      const regex = new RegExp(`(${param}=)[^&]*`, "gi");
+      logUrl = lower.replace(regex, "$1[REDACTED]");
+    });
+  }
+  logInfo(`${req.method} ${logUrl}`, { ip: req.ip });
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    logInfo(`${req.method} ${req.url} ${res.statusCode}`, { duration: `${duration}ms` });
+    logInfo(`${req.method} ${logUrl} ${res.statusCode}`, { duration: `${duration}ms` });
   });
 
   next();
 });
+
+function safeParseInt(value: any, fallback = 0): number {
+  const n = typeof value === "string" ? parseInt(value, 10) : Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 // API-key аутентификация (включается только если задан API_KEY в .env)
 function apiKeyAuth(req: any, res: any, next: any) {
@@ -145,10 +167,14 @@ function parseRoiZones(cam: any): any[] {
 function isPointInRoi(x: number, y: number, zones: any[]): boolean {
   if (!zones.length) return true;
   for (const zone of zones) {
-    const x1 = Number(zone.x1 ?? zone.x ?? 0);
-    const y1 = Number(zone.y1 ?? zone.y ?? 0);
-    const x2 = Number(zone.x2 ?? zone.x + zone.width ?? 0);
-    const y2 = Number(zone.y2 ?? zone.y + zone.height ?? 0);
+    const zoneX = Number(zone.x ?? zone.x1 ?? 0);
+    const zoneY = Number(zone.y ?? zone.y1 ?? 0);
+    const zoneW = Number(zone.width ?? (zone.x2 ?? 0) - zoneX ?? 0);
+    const zoneH = Number(zone.height ?? (zone.y2 ?? 0) - zoneY ?? 0);
+    const x1 = zoneX;
+    const y1 = zoneY;
+    const x2 = zoneX + zoneW;
+    const y2 = zoneY + zoneH;
     if (x >= x1 && x <= x2 && y >= y1 && y <= y2) return true;
   }
   return false;
@@ -374,25 +400,28 @@ function findNameAndSimilarity(obj: any, depth = 0, visited = new Set<object>())
   return { name, similarity };
 }
 
-app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), (req, res) => {
+app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), async (req, res) => {
   logDebug("UNV LAPI Webhook received", { headers: req.headers['content-type'], query: req.query, bodyKeys: Object.keys(req.body) });
   
-  let cameraId = parseInt(req.query.camera_id as string || req.query.id as string || "");
+  let cameraId = safeParseInt(req.query.camera_id || req.query.id, 0);
   let camera = cameras.find(c => c.id === cameraId);
   
   if (!camera) {
-    // Fallback: match by IP address
-    const incomingIp = req.ip || req.socket.remoteAddress || "";
-    logDebug("Attempting to find UNV camera by IP", { incomingIp });
-    camera = cameras.find(c => 
-      c.camera_type === "UNV" && 
-      c.ip_address && 
-      (incomingIp.includes(c.ip_address) || c.ip_address.includes(incomingIp))
-    );
+    const incomingIp = (req.ip || req.socket.remoteAddress || "").replace(/^::ffff:/i, "");
+    if (incomingIp) {
+      camera = cameras.find(c =>
+        c.camera_type === "UNV" &&
+        c.ip_address &&
+        (c.ip_address === incomingIp || incomingIp === c.ip_address)
+      );
+    }
   }
-  
+
   if (!camera) {
-    camera = cameras.find(c => c.camera_type === "UNV") || cameras[0];
+    const singleUnv = cameras.filter(c => c.camera_type === "UNV");
+    if (singleUnv.length === 1) {
+      camera = singleUnv[0];
+    }
   }
 
   if (!camera) {
@@ -491,165 +520,144 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
   }
 
   // Async: lookup person in DB and persist event
-  (async () => {
-    try {
-      let matchedPerson: any = null;
-      if (personName && personName.toLowerCase() !== "unknown" && personName.toLowerCase() !== "неизвестный") {
-        const allPersons = await prisma.person.findMany({ select: { id: true, name: true, category: true, photo_path: true, visit_count: true } });
-        matchedPerson = allPersons.find((p: any) => p.name.toLowerCase() === personName!.toLowerCase());
-      }
+  let responseSent = false;
+  try {
+    let matchedPerson: any = null;
+    if (personName && personName.toLowerCase() !== "unknown" && personName.toLowerCase() !== "неизвестный") {
+      const allPersons = await prisma.person.findMany({ select: { id: true, name: true, category: true, photo_path: true, visit_count: true } });
+      matchedPerson = allPersons.find((p: any) => p.name.toLowerCase() === personName!.toLowerCase());
+    }
 
-      if (matchedPerson) {
-        await prisma.person.update({
-          where: { id: matchedPerson.id },
-          data: { visit_count: { increment: 1 }, last_seen_at: new Date() },
-        });
-        // Sync in-memory
-        const idx = persons.findIndex((p) => p.id === matchedPerson.id);
-        if (idx >= 0) { persons[idx].visit_count++; persons[idx].last_seen_at = new Date().toISOString(); }
+    if (matchedPerson) {
+      await prisma.person.update({
+        where: { id: matchedPerson.id },
+        data: { visit_count: { increment: 1 }, last_seen_at: new Date() },
+      });
+      const idx = persons.findIndex((p) => p.id === matchedPerson.id);
+      if (idx >= 0) { persons[idx].visit_count++; persons[idx].last_seen_at = new Date().toISOString(); }
 
-        let event_type = "RECOGNIZED";
-        if (matchedPerson.category === "VIP") event_type = "VIP_ARRIVAL";
-        else if (matchedPerson.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
-        else if (matchedPerson.category === "RESPONSE") event_type = "RESPONSE_ALERT";
+      let event_type = "RECOGNIZED";
+      if (matchedPerson.category === "VIP") event_type = "VIP_ARRIVAL";
+      else if (matchedPerson.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
+      else if (matchedPerson.category === "RESPONSE") event_type = "RESPONSE_ALERT";
 
-        const eventConfidence = confidence || 0.85;
-        const meetsVerification = (eventConfidence * 100) >= verification_threshold_pct;
+      const eventConfidence = confidence || 0.85;
+      const meetsVerification = (eventConfidence * 100) >= verification_threshold_pct;
 
-        await prisma.event.create({
-          data: {
-            camera_id: camera.id,
-            camera_name: camera.name,
-            person_id: matchedPerson.id,
-            event_type,
-            confidence: eventConfidence,
-            snapshot_path,
-            person_name: matchedPerson.name,
-            person_category: matchedPerson.category,
-            person_photo_path: matchedPerson.photo_path,
-            needs_operator_confirmation: !meetsVerification,
-    confirmation_status: meetsVerification ? undefined : "pending",
-          },
-        });
-
-        broadcastSecurity({
-          type: "ALERT",
-          category: matchedPerson.category,
-          person_id: matchedPerson.id,
-          person_name: matchedPerson.name,
+      await prisma.event.create({
+        data: {
           camera_id: camera.id,
+          camera_name: camera.name,
+          person_id: matchedPerson.id,
+          event_type,
           confidence: eventConfidence,
           snapshot_path,
-          timestamp: new Date().toISOString(),
-        });
-        broadcastSecurity({ type: "EVENT" });
-      } else {
-        await prisma.event.create({
-          data: {
-            camera_id: camera.id,
-            camera_name: camera.name,
-            event_type: "UNKNOWN",
-            confidence: confidence || 0.5,
-            snapshot_path,
-            person_name: personName || "Неизвестный",
-            person_category: "CLIENT",
-          },
-        });
-        broadcastSecurity({
-          type: "ALERT",
-          category: "CLIENT",
-          person_name: personName || "Неизвестный",
+          person_name: matchedPerson.name,
+          person_category: matchedPerson.category,
+          person_photo_path: matchedPerson.photo_path,
+          needs_operator_confirmation: !meetsVerification,
+          confirmation_status: meetsVerification ? undefined : "pending",
+        },
+      });
+
+      broadcastSecurity({
+        type: "ALERT",
+        category: matchedPerson.category,
+        person_id: matchedPerson.id,
+        person_name: matchedPerson.name,
+        camera_id: camera.id,
+        confidence: eventConfidence,
+        snapshot_path,
+        timestamp: new Date().toISOString(),
+      });
+      broadcastSecurity({ type: "EVENT" });
+    } else {
+      await prisma.event.create({
+        data: {
           camera_id: camera.id,
+          camera_name: camera.name,
+          event_type: "UNKNOWN",
           confidence: confidence || 0.5,
           snapshot_path,
-          timestamp: new Date().toISOString(),
-        });
-        broadcastSecurity({ type: "EVENT" });
-      }
-    } catch (dbErr) {
-      logError(dbErr as Error, { context: "UNV webhook DB persist" });
+          person_name: personName || "Неизвестный",
+          person_category: "CLIENT",
+        },
+      });
+      broadcastSecurity({
+        type: "ALERT",
+        category: "CLIENT",
+        person_name: personName || "Неизвестный",
+        camera_id: camera.id,
+        confidence: confidence || 0.5,
+        snapshot_path,
+        timestamp: new Date().toISOString(),
+      });
+      broadcastSecurity({ type: "EVENT" });
     }
-  })();
-
-  res.json({ success: true, camera_id: camera.id, processed: true });
+    responseSent = true;
+    res.json({ success: true, camera_id: camera.id, processed: true });
+  } catch (dbErr) {
+    logError(dbErr as Error, { context: "UNV webhook DB persist" });
+    if (!responseSent) {
+      res.status(500).json({ error: "Failed to persist event" });
+    }
+  }
 });
 
-app.post(["/api/cameras/:id/test-connection", "/api/cameras/:id/test-connection/"], (req, res) => {
-  const id = parseInt(req.params.id);
+app.post(["/api/cameras/:id/test-connection", "/api/cameras/:id/test-connection/"], async (req, res) => {
+  const id = safeParseInt(req.params.id, 0);
   const cam = cameras.find((c) => c.id === id);
-  if (cam) {
-    if (cam.camera_type === "UNV") {
-      res.json({
-        connected: true,
-        brand: "Uniview",
-        model: "IPC3238EA LAPI (Face Recognition Series)",
-        driver_type: "UNV LAPI Push Webhook / Готово к получению Face Push. Укажите адрес: http://ваш-сервер:3000/api/cameras/unv/notification?camera_id=" + cam.id,
-        resolution: "3840x2160 (4K UHD)",
-        codec: "H.265 / Smart Face Stream",
-        status_info: "Ожидание HTTP POST от камеры. Канал связи активен."
-      });
-    } else if (cam.camera_type === "Hikvision") {
-      res.json({
-        connected: true,
-        brand: "Hikvision",
-        model: "DS-2CD2183G0-I (Smart Face Recognition)",
-        driver_type: "Hikvision ISAPI Smart Driver",
-        resolution: "3840x2160 (4K)",
-        codec: "H.264 / ISAPI JSON Event stream",
-        status_info: "Интеграция ISAPI активна. Авторизация успешна. Права на чтение событий получены."
-      });
-    } else if (cam.camera_type === "ONVIF") {
-      res.json({
-        connected: true,
-        brand: "ONVIF Profile S/T",
-        model: "Auto-discovered Network IP Camera",
-        driver_type: "ONVIF WSDL Client v2.4",
-        resolution: "1920x1080 (FullHD)",
-        codec: "H.264 / RTSP unicast",
-        status_info: "Авторизация ONVIF успешна. XML-WSDL API доступно. Поток RTSP захвачен."
-      });
-    } else if (cam.camera_type === "RTSP") {
-      res.json({
-        connected: true,
-        brand: "IP Camera (RTSP)",
-        model: "Generic RTSP Streamer",
-        driver_type: "Direct FFmpeg/RTSP Grabber",
-        resolution: "1920x1080 (FullHD)",
-        codec: "H.264 / AAC Audio",
-        status_info: "Поток RTSP успешно захвачен и декодирован. Ошибок пакетов нет."
-      });
-    } else if (cam.camera_type === "IP") {
-      res.json({
-        connected: true,
-        brand: "IP Camera (HTTP)",
-        model: "HTTP MJPEG Streamer",
-        driver_type: "HTTP Multipart stream parser",
-        resolution: "1280x720",
-        codec: "Motion JPEG",
-        status_info: "HTTP соединение установлено. Заголовки multipart/x-mixed-replace получены."
-      });
-    } else {
-      res.json({
-        connected: true,
-        brand: "KrakenEye USB",
-        model: "Pro WebCam v4",
-        driver_type: "V4L2 Linux Kernel Driver",
-        resolution: "1280x720",
-        codec: "YUY2 / Raw MJPEG",
-        status_info: "Устройство захвата /dev/video успешно открыто. Сигнал стабильный."
-      });
-    }
-  } else {
-    res.json({
-      connected: true,
-      brand: "KrakenEye",
-      model: "Generic IP Camera",
-      driver_type: "ONVIF/RTSP",
-      resolution: "1920x1080",
-      codec: "H.264",
-      status_info: "Временный симулятор потока активен."
-    });
+  if (!cam) {
+    return res.status(404).json({ connected: false, detail: "Camera not found" });
   }
+
+  const hasSource = Boolean(cam.source && cam.source.trim().length > 0);
+  const isActive = cam.is_active !== false;
+  const connected = hasSource && isActive;
+
+  if (cam.camera_type === "UNV") {
+    res.json({
+      connected,
+      brand: "Uniview",
+      model: "IPC3238EA LAPI (Face Recognition Series)",
+      driver_type: cam.use_camera_analytics
+        ? "UNV LAPI Push Webhook"
+        : "Direct RTSP / Лучше включить аналитику камеры",
+      resolution: "3840x2160 (4K UHD)",
+      codec: "H.265 / Smart Face Stream",
+      status_info: cam.use_camera_analytics
+        ? "Ожидание HTTP POST от камеры. Канал связи активен."
+        : "RTSP-канал настроен. Для снижения нагрузки включите use_camera_analytics.",
+    });
+    return;
+  }
+
+  if (cam.camera_type === "Hikvision") {
+    res.json({
+      connected,
+      brand: "Hikvision",
+      model: "DS-2CD2442FWD-I",
+      driver_type: "Hikvision ISAPI / RTSP",
+      resolution: "2560x1440 (4MP)",
+      codec: "H.265 / ISAPI JSON Event stream",
+      status_info: connected
+        ? "RTSP-канал настроен. Проверьте доступность камеры в локальной сети."
+        : "Нет источника/камера выключена.",
+    });
+    return;
+  }
+
+  res.json({
+    connected,
+    brand: cam.camera_type || "Generic",
+    model: "Network Camera",
+    driver_type: "Direct FFmpeg/RTSP Grabber",
+    resolution: "1920x1080",
+    codec: "H.264",
+    status_info: connected
+      ? "Источник настроен. Доступность зависит от сети."
+      : "Нет источника/камера выключена.",
+  });
 });
 
 app.post(["/api/recordings/start/:id", "/api/recordings/start/:id/"], async (req, res) => {
@@ -705,13 +713,22 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
 app.put("/api/cameras/:id", async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    // Exclude fields that don't exist in Prisma schema
-    const { created_at, ...updateData } = req.body;
+    const allowedFields = [
+      "name", "source", "camera_type", "zone", "is_active", "status",
+      "roi_zones", "fps", "ping_ms", "is_smart_recording", "is_chronicle",
+      "driver_type", "ip_address", "ip_port", "username", "password",
+      "use_camera_analytics", "snapshot_path"
+    ];
+    const updateData: any = {};
+    for (const key of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        updateData[key] = req.body[key];
+      }
+    }
     const updated = await prisma.camera.update({
       where: { id },
       data: updateData,
     });
-    // Sync in-memory
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
     res.json(sanitizeCamera(updated));
@@ -836,6 +853,7 @@ app.get("/api/cameras/:id/snapshot", (req, res) => {
     image: imageBuffer.toString("base64"),
     content_type: "image/jpeg",
   });
+  res.setHeader("Cache-Control", "no-store");
 });
 
 app.post("/api/cameras/:id/capture", (req, res) => {
@@ -996,17 +1014,17 @@ app.get(["/api/persons/check_duplicate", "/api/persons/check_duplicate/"], async
       return res.json({ duplicate: false, matches: [] });
     }
 
-    const allPersons = await prisma.person.findMany({
-      select: {
-        id: true,
-        name: true,
-        category: true
-      }
-    });
-
-    const matches = allPersons.filter((p: any) => 
-      (p.name || "").toLowerCase().includes(name)
-    );
+     const matches = await prisma.person.findMany({
+       where: {
+         name: { contains: name, mode: "insensitive" } as any
+       },
+       select: {
+         id: true,
+         name: true,
+         category: true
+       } as any,
+       take: 20
+     });
 
     res.json({
       duplicate: matches.length > 0,
@@ -1022,14 +1040,21 @@ app.get(["/api/persons/check_duplicate", "/api/persons/check_duplicate/"], async
 app.delete(["/api/persons/by_category/:category", "/api/persons/by_category/:category/"], async (req, res) => {
   try {
     const category = req.params.category.toUpperCase().trim();
-
+    if (!category) {
+      return res.status(400).json({ detail: "Category is required" });
+    }
+    const protectedCategories = ["SYSTEM", "DEFAULT"];
+    if (protectedCategories.includes(category)) {
+      return res.status(403).json({ detail: "Cannot delete system categories" });
+    }
+    const count = await prisma.person.count({ where: { category } });
+    if (count > 100) {
+      return res.status(413).json({ detail: `Too many persons to delete at once (${count}). Use bulk delete with IDs instead.` });
+    }
     const deleted = await prisma.person.deleteMany({
       where: { category }
     });
-
-    // Sync in-memory
     persons = persons.filter((p) => p.category !== category);
-
     res.json({ ok: true, deleted: deleted.count });
   } catch (err) {
     logError(err as Error, { path: "/api/persons/by_category/:category", method: "DELETE" });
@@ -1154,10 +1179,19 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
 app.put("/api/persons/:id", async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-
+    const allowedFields = [
+      "name", "category", "position", "comment", "phone",
+      "email", "birth_date", "address", "organization", "extra_info", "is_active"
+    ];
+    const updateData: any = {};
+    for (const key of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        updateData[key] = req.body[key];
+      }
+    }
     const updatedPerson = await prisma.person.update({
       where: { id },
-      data: req.body,
+      data: updateData,
       include: { photos: true }
     });
 
@@ -1204,6 +1238,16 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
 });
 
 const importJobs: Record<string, any> = {};
+const IMPORT_JOB_TTL_MS = 30 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [jobId, job] of Object.entries(importJobs)) {
+    if (now - (job.createdAt || now) > IMPORT_JOB_TTL_MS) {
+      delete importJobs[jobId];
+    }
+  }
+}, 5 * 60 * 1000);
 
 app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any(), (req, res) => {
   let files: Express.Multer.File[] = [];
@@ -1222,7 +1266,8 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     progress: 0,
     created: [],
     failed: [],
-    skipped: []
+    skipped: [],
+    createdAt: Date.now(),
   };
 
   // Process files asynchronously
@@ -1266,15 +1311,11 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
 
         // Ищем существующую персону в БД (case-insensitive для SQLite)
         const existingPersons = await prisma.person.findMany({
-          where: { name: { equals: cleanName } },
+          where: { name: { equals: cleanName, mode: "insensitive" } } as any,
           include: { photos: true },
           take: 1,
         });
-        // Fallback: toLowerCase match если Prisma не нашла точное совпадение
-        const existingPerson = existingPersons[0]
-          ?? (await prisma.person.findMany({ include: { photos: true } }))
-              .find((p: any) => p.name.toLowerCase() === cleanName.toLowerCase())
-          ?? null;
+        const existingPerson = existingPersons[0] || null;
 
         let personId: number;
         if (existingPerson) {
@@ -3269,6 +3310,8 @@ const cameraFrames = new Map<number, { frame: string; faces: any[] }>();
 const cameraDetectionTimers = new Map<number, NodeJS.Timeout>();
 // Счётчик неудачных запусков FFmpeg на камеру (для экспоненциального backoff при недоступной камере)
 const cameraFfmpegRetries = new Map<number, number>();
+const cameraFfmpegFailCount = new Map<number, number>();
+const cameraWebhookFallback = new Map<number, boolean>();
 // Отложенные таймеры перезапуска FFmpeg (чтобы их можно было отменить при остановке пайплайна)
 const cameraRestartTimers = new Map<number, NodeJS.Timeout>();
 
@@ -3363,15 +3406,15 @@ function getStreamResolution(cam: any): { width: number; height: number } {
     return { width: 640, height: 480 };
   }
   const key = cam.camera_type || "RTSP";
-  const w = parseInt(process.env[`${key}_STREAM_WIDTH`] || process.env["STREAM_WIDTH"] || "2560", 10);
-  const h = parseInt(process.env[`${key}_STREAM_HEIGHT`] || process.env["STREAM_HEIGHT"] || "1440", 10);
+  const w = parseInt(process.env[`${key}_STREAM_WIDTH`] || process.env["STREAM_WIDTH"] || "1920", 10);
+  const h = parseInt(process.env[`${key}_STREAM_HEIGHT`] || process.env["STREAM_HEIGHT"] || "1080", 10);
   return { width: w, height: h };
 }
 
 function startCameraPipeline(cam: any, fallbackFrame: string) {
   if (!cam.source) return;
-  if (cam.use_camera_analytics) {
-    logInfo(`Камера ${cam.id} (${cam.name}) использует встроенную аналитику — FFmpeg/детекция не запускаются`);
+  if (cameraWebhookFallback.get(cam.id)) {
+    logWarn(`Камера ${cam.id} (${cam.name}) сейчас работает в fallback-режиме по вебхукам — FFmpeg не запускается`);
     return;
   }
 
@@ -3435,6 +3478,11 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         }
         // Пошёл реальный поток — сбрасываем счётчик неудач, чтобы backoff обнулился
         if (cameraFfmpegRetries.has(cam.id)) cameraFfmpegRetries.delete(cam.id);
+        if (cameraFfmpegFailCount.has(cam.id)) cameraFfmpegFailCount.delete(cam.id);
+        if (cameraWebhookFallback.has(cam.id)) {
+          cameraWebhookFallback.delete(cam.id);
+          logInfo(`Камера ${cam.id} (${cam.name}) восстановила RTSP, fallback-режим отключён`);
+        }
         acc = acc.slice(e + 2);
         headerFound = false;
       }
@@ -3464,9 +3512,21 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
 
       const attempts = (cameraFfmpegRetries.get(cam.id) || 0) + 1;
       cameraFfmpegRetries.set(cam.id, attempts);
+      if (!cameraFfmpegFailCount.has(cam.id)) cameraFfmpegFailCount.set(cam.id, 0);
+      cameraFfmpegFailCount.set(cam.id, (cameraFfmpegFailCount.get(cam.id) || 0) + 1);
       const delay = Math.min(30000, 3000 * 2 ** Math.min(attempts - 1, 4));
       if (attempts === 1 || attempts % 5 === 0) {
         logWarn(`Камера ${cam.id} (${cam.name}) недоступна, попытка №${attempts}, следующий повтор через ${delay / 1000}с`);
+      }
+
+      if (cam.camera_type === "UNV" && (cameraFfmpegFailCount.get(cam.id) || 0) >= 5) {
+        cameraWebhookFallback.set(cam.id, true);
+        cameraRestartTimers.get(cam.id) && clearTimeout(cameraRestartTimers.get(cam.id)!);
+        cameraRestartTimers.delete(cam.id);
+        cameraFfmpegRetries.delete(cam.id);
+        cameraFfmpegFailCount.delete(cam.id);
+        logWarn(`Камера ${cam.id} (${cam.name}) переключена в fallback-режим UNV webhook после нескольких неудач RTSP`);
+        return;
       }
 
       const restartTimer = setTimeout(() => {
