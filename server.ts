@@ -169,8 +169,8 @@ function isPointInRoi(x: number, y: number, zones: any[]): boolean {
   for (const zone of zones) {
     const zoneX = Number(zone.x ?? zone.x1 ?? 0);
     const zoneY = Number(zone.y ?? zone.y1 ?? 0);
-    const zoneW = Number(zone.width ?? (zone.x2 ?? 0) - zoneX ?? 0);
-    const zoneH = Number(zone.height ?? (zone.y2 ?? 0) - zoneY ?? 0);
+    const zoneW = Number(zone.width ?? ((zone.x2 ?? 0) - zoneX));
+    const zoneH = Number(zone.height ?? ((zone.y2 ?? 0) - zoneY));
     const x1 = zoneX;
     const y1 = zoneY;
     const x2 = zoneX + zoneW;
@@ -487,7 +487,9 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
   
   if (filesList.length > 0) {
     const file = filesList[0];
-    const targetFilename = getSmartCaptureFilename(personName, path.extname(file.originalname) || '.jpg');
+    const rawExt = path.extname(file.originalname).toLowerCase();
+    const safeExt = [".jpg", ".jpeg", ".png", ".webp", ".bmp"].includes(rawExt) ? rawExt : ".jpg";
+    const targetFilename = getSmartCaptureFilename(personName, safeExt);
     const targetPath = path.join(snapshotsDir, targetFilename);
     try {
       fs.copyFileSync(file.path, targetPath);
@@ -3439,7 +3441,7 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
     let headerFound = false;
 
     proc.stdout.on("data", (chunk: Buffer) => {
-      acc = acc.length ? Buffer.concat([acc, chunk]) : chunk;
+      acc = acc.length ? Buffer.concat([acc, chunk]) : (chunk as Buffer);
 
       // Ограничиваем размер буфера, чтобы не съесть память при сбоях потока
       if (acc.length > 8 * 1024 * 1024) acc = acc.slice(acc.length - 64);
