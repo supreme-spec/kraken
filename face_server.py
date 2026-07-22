@@ -364,7 +364,10 @@ def _crop_face_region(img: np.ndarray, bbox: np.ndarray, pad_ratio: float = 0.2)
     if img is None or img.size == 0:
         return None
     try:
-        x1, y1, x2, y2 = bbox.astype(int).tolist()[:4]
+        bbox_list = bbox.astype(int).tolist()
+        if len(bbox_list) < 4:
+            return None
+        x1, y1, x2, y2 = bbox_list[:4]
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
         pad = int(max(w, h) * pad_ratio)
@@ -859,12 +862,15 @@ async def recognize(
             if sim > best_sim:
                 best_sim = sim
 
-            # Не отбрасываем кандидата с ВЫСОКИМ сходством из-за несовпадения
-            # категории: такой кандидат должен попасть к оператору на подтверждение
-            # (серая зона / авто-распознавание), а не молча уходить в unknown.
             if category and person.get("category") != category:
-                if sim < LOW_THRESHOLD:
-                    continue
+                if sim >= LOW_THRESHOLD:
+                    needs_confirmation_data = {
+                        "person_id": person["person_id"],
+                        "person_name": person["person_name"],
+                        "similarity": sim,
+                        "photo_path": person.get("photo_path", ""),
+                    }
+                continue
 
             if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
                 needs_confirmation_data = {
@@ -955,12 +961,15 @@ async def recognize_by_descriptor(
             if sim > best_sim:
                 best_sim = sim
 
-            # Не отбрасываем кандидата с ВЫСОКИМ сходством из-за несовпадения
-            # категории: такой кандидат должен попасть к оператору на подтверждение
-            # (серая зона / авто-распознавание), а не молча уходить в unknown.
             if category and person.get("category") != category:
-                if sim < LOW_THRESHOLD:
-                    continue
+                if sim >= LOW_THRESHOLD:
+                    needs_confirmation_data = {
+                        "person_id": person["person_id"],
+                        "person_name": person["person_name"],
+                        "similarity": sim,
+                        "photo_path": person.get("photo_path", ""),
+                    }
+                continue
 
             if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
                 needs_confirmation_data = {

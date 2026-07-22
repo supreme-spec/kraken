@@ -85,7 +85,7 @@ function apiKeyAuth(req: any, res: any, next: any) {
 app.use("/api", apiKeyAuth);
 
 // ── ENSURE DIRECTORIES & ASSETS EXIST ──
-const FALLBACK_JPEG = "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
+const FALLBACK_JPEG = "/9j/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCADwAUADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAME/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AnIDSiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//9k=";
 
 const publicDir = path.join(process.cwd(), "public");
 const photosDir = path.join(publicDir, "photos");
@@ -310,12 +310,13 @@ app.post(["/api/cameras/:id/stop", "/api/cameras/:id/stop/"], async (req, res) =
   }
 });
 
-function findNameAndSimilarity(obj: any): { name?: string, similarity?: number } {
-  if (!obj || typeof obj !== 'object') return {};
+function findNameAndSimilarity(obj: any, depth = 0, visited = new Set<object>()): { name?: string, similarity?: number } {
+  if (!obj || typeof obj !== 'object' || depth > 10) return {};
+  if (visited.has(obj)) return {};
+  visited.add(obj);
   let name: string | undefined;
   let similarity: number | undefined;
 
-  // Direct fields commonly used in LAPI / HTTP Push JSON
   if (typeof obj.Name === 'string') name = obj.Name;
   else if (typeof obj.name === 'string') name = obj.name;
   else if (typeof obj.MemberName === 'string') name = obj.MemberName;
@@ -331,10 +332,9 @@ function findNameAndSimilarity(obj: any): { name?: string, similarity?: number }
   else if (typeof obj.score === 'number') similarity = obj.score;
   else if (typeof obj.Score === 'number') similarity = obj.Score;
 
-  // Recursively search sub-properties
   for (const key of Object.keys(obj)) {
     if (typeof obj[key] === 'object' && obj[key] !== null) {
-      const sub = findNameAndSimilarity(obj[key]);
+      const sub = findNameAndSimilarity(obj[key], depth + 1, visited);
       if (sub.name && !name) name = sub.name;
       if (sub.similarity !== undefined && similarity === undefined) similarity = sub.similarity;
     }
@@ -748,21 +748,56 @@ app.get("/api/cameras/:id/snapshot", (req, res) => {
   const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
   const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
 
-  // Пытаемся найти последний снимок камеры в папке snapshots
-  const cameraSnapshots = cameras.find(c => c.id === id);
   let imageBuffer: Buffer;
-  
-  if (cameraSnapshots && cameraSnapshots.snapshot_path) {
-    const fullPath = path.join(process.cwd(), "public", cameraSnapshots.snapshot_path);
-    if (fs.existsSync(fullPath)) {
-      imageBuffer = fs.readFileSync(fullPath);
+
+  try {
+    const cam = cameras.find(c => c.id === id);
+    if (!cam || !cam.is_active) {
+      imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+    } else if (cameraFrames.has(id)) {
+      const shared = cameraFrames.get(id);
+      const frame = shared?.frame;
+      if (frame && frame !== getFallbackFrame()) {
+        imageBuffer = Buffer.from(frame, "base64");
+      } else {
+        imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+      }
+    } else if (cam && cam.snapshot_path) {
+      const fullPath = path.join(process.cwd(), "public", cam.snapshot_path);
+      if (fs.existsSync(fullPath)) {
+        const candidate = fs.readFileSync(fullPath);
+        if (candidate.length > 2 && candidate[0] === 0xFF && candidate[1] === 0xD8) {
+          imageBuffer = candidate;
+        } else {
+          imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+        }
+      } else {
+        imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+      }
+    } else if (cam) {
+      const pattern = path.join(snapshotsDir, `cam${id}_*.jpg`);
+      try {
+        const matches = fs.readdirSync(snapshotsDir).filter(f => f.startsWith(`cam${id}_`) && f.endsWith('.jpg'));
+        if (matches.length > 0) {
+          const latest = matches.sort().pop()!;
+          const candidate = fs.readFileSync(path.join(snapshotsDir, latest));
+          if (candidate.length > 2 && candidate[0] === 0xFF && candidate[1] === 0xD8) {
+            imageBuffer = candidate;
+          } else {
+            imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+          }
+        } else {
+          imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+        }
+      } catch {
+        imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+      }
     } else {
-      // Fallback на rus.jpg
-      imageBuffer = fs.existsSync(rusSrc) ? fs.readFileSync(rusSrc) : fs.readFileSync(logoSrc);
+      imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
     }
-  } else {
-    // Fallback на rus.jpg
-    imageBuffer = fs.existsSync(rusSrc) ? fs.readFileSync(rusSrc) : fs.readFileSync(logoSrc);
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/snapshot" });
+    imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
   }
 
   res.json({
@@ -2035,7 +2070,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
     const [
       cacheEnabled, cacheTtl, qualityThreshold, adaptiveSkip,
       faissThreshold, faissNprobe, camWeights, verifyThreshold, autoCreateUnknown,
-      confirmThreshold, lowThreshold
+      confirmThreshold, lowThreshold, recognitionThreshold
     ] = await Promise.all([
       loadSetting("embedding_cache_enabled", embedding_cache_enabled),
       loadSetting("embedding_cache_ttl_days", embedding_cache_ttl_days),
@@ -2048,6 +2083,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       loadSetting("auto_create_unknown_persons", auto_create_unknown_persons),
       loadSetting("confirmation_threshold_pct", confirmation_threshold_pct),
       loadSetting("low_threshold_pct", low_threshold_pct),
+      loadSetting("recognition_threshold_pct", recognition_threshold_pct),
     ]);
     // Sync in-memory
     embedding_cache_enabled = cacheEnabled;
@@ -2061,6 +2097,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
     auto_create_unknown_persons = autoCreateUnknown;
     confirmation_threshold_pct = confirmThreshold;
     low_threshold_pct = lowThreshold;
+    recognition_threshold_pct = recognitionThreshold;
 
     res.json({
       embedding_cache_enabled,
@@ -2074,6 +2111,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       auto_create_unknown_persons,
       confirmation_threshold_pct,
       low_threshold_pct,
+      recognition_threshold_pct,
     });
   } catch (err) {
     logError(err as Error, { path: "/api/settings", method: "GET" });
@@ -2126,6 +2164,13 @@ app.post(["/api/settings", "/api/settings/"], async (req, res) => {
     }
     if (req.body.low_threshold_pct !== undefined) {
       low_threshold_pct = req.body.low_threshold_pct;
+      saves.push(saveSetting("low_threshold_pct", low_threshold_pct));
+    }
+    if (req.body.recognition_threshold_pct !== undefined) {
+      recognition_threshold_pct = Number(req.body.recognition_threshold_pct);
+      saves.push(saveSetting("recognition_threshold_pct", recognition_threshold_pct));
+
+      low_threshold_pct = recognition_threshold_pct;
       saves.push(saveSetting("low_threshold_pct", low_threshold_pct));
     }
     await Promise.all(saves);
@@ -2576,7 +2621,8 @@ function buildFfmpegInputArgs(cam: any): string[] {
       const idx = parseInt(m[1], 10);
       inputSource = idx === 0 ? "USB Video Device" : `USB Video Device #${idx + 1}`;
     }
-    return ["-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", `video=${inputSource}`];
+    const clean = inputSource.replace(/^video=/i, "");
+    return ["-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", `video=${clean}`];
   }
   // RTSP / IP / Hikvision / UNV: подставляем сохранённые учётные данные в URL, если их нет в source
   let source = (cam.source || "").trim();
@@ -2590,8 +2636,19 @@ function buildFfmpegInputArgs(cam: any): string[] {
       // не URL — оставляем как есть
     }
   }
+  // Для Hikvision/UNV/ONVIF полезно добавить таймауты и снизить буфер,
+  // чтобы поток стабильнее держался и быстрее падал при потере камеры.
+  const extraRtspFlags = cam.camera_type === "Hikvision"
+    ? ["-fflags", "+nobuffer+discardcorrupt"]
+    : [];
   // -hide_banner + -loglevel error: не засоряем логи баннером версии/конфигурации на каждом (пере)запуске
-  return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
+  return [
+    "-hide_banner", "-loglevel", "error",
+    "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp",
+    ...extraRtspFlags,
+    "-timeout", "5000000",
+    "-i", source,
+  ];
 }
 
 // Активные записи видео: cameraId -> сессия
@@ -3016,7 +3073,7 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
 
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
 async function processDetectedFaces(cam: any, frameBase64: string, faces: any[]): Promise<any[]> {
-  const lowT = low_threshold_pct / 100;
+  const minThreshold = Math.max(low_threshold_pct, recognition_threshold_pct) / 100;
   const confirmT = confirmation_threshold_pct / 100;
   const enriched: any[] = [];
   for (let i = 0; i < faces.length; i++) {
@@ -3032,7 +3089,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     // Ищем до НИЖНЕГО порога бэнда, чтобы поймать кандидатов 40-55% (подтверждение)
     let match: any = null;
     if (desc && desc.length) {
-      const matches = await searchByDescriptor(desc, lowT, 1);
+      const matches = await searchByDescriptor(desc, minThreshold, 1);
       if (matches.length) match = matches[0];
     }
     const sim = match ? match.similarity : 0;
@@ -3053,7 +3110,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         lastEventAt.set(key, Date.now());
         await handleRecognizedEvent(cam, match, frameBase64);
       }
-    } else if (match && sim >= lowT) {
+    } else if (match && sim >= minThreshold) {
       // БЭНД ПОДТВЕРЖДЕНИЯ ОПЕРАТОРА (low_threshold .. confirmation_threshold)
       enriched.push({
         track_id: i + 1,
@@ -3310,6 +3367,18 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         const shared = cameraFrames.get(cam.id) || { frame: fallbackFrame, faces: [] };
         shared.frame = jpeg.toString("base64");
         cameraFrames.set(cam.id, shared);
+        if (!(cam as any).snapshot_path || !fs.existsSync(path.join(snapshotsDir, path.basename((cam as any).snapshot_path)))) {
+          const snapName = `snapshots/cam${cam.id}_auto.jpg`;
+          const snapPath = path.join(snapshotsDir, `cam${cam.id}_auto.jpg`);
+          try {
+            fs.writeFileSync(snapPath, jpeg);
+            const idx = cameras.findIndex((c) => c.id === cam.id);
+            if (idx >= 0) cameras[idx].snapshot_path = snapName;
+            logInfo(`Автосохранён снимок для ROI-редактора камеры ${cam.id}: ${snapName}`);
+          } catch (e) {
+            logError(e as Error, { context: `auto-save snapshot camera ${cam.id}` });
+          }
+        }
         // Пошёл реальный поток — сбрасываем счётчик неудач, чтобы backoff обнулился
         if (cameraFfmpegRetries.has(cam.id)) cameraFfmpegRetries.delete(cam.id);
         acc = acc.slice(e + 2);
@@ -3326,19 +3395,22 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
       activeFfmpegProcesses.delete(cam.id);
       cameraFrames.delete(cam.id);
 
-      // Нет смысла перезапускать, если для камеры не осталось клиентов или она выключена
       const currentCam = cameras.find(c => c.id === cam.id);
-      const hasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
-      if (!currentCam || !currentCam.is_active || !hasClients) {
+      if (!currentCam || !currentCam.is_active) {
         cameraFfmpegRetries.delete(cam.id);
         return;
       }
 
-      // Экспоненциальный backoff: 3s → 6s → 12s → 24s → 30s (кап), чтобы не долбить недоступную камеру
+      const hasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
+      if (!hasClients) {
+        logInfo(`Камера ${cam.id} (${cam.name}) остановлена: нет подключенных клиентов`);
+        cameraFfmpegRetries.delete(cam.id);
+        return;
+      }
+
       const attempts = (cameraFfmpegRetries.get(cam.id) || 0) + 1;
       cameraFfmpegRetries.set(cam.id, attempts);
       const delay = Math.min(30000, 3000 * 2 ** Math.min(attempts - 1, 4));
-      // Логируем не каждую попытку, чтобы не засорять лог при долгой недоступности
       if (attempts === 1 || attempts % 5 === 0) {
         logWarn(`Камера ${cam.id} (${cam.name}) недоступна, попытка №${attempts}, следующий повтор через ${delay / 1000}с`);
       }
@@ -3346,8 +3418,7 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
       const restartTimer = setTimeout(() => {
         cameraRestartTimers.delete(cam.id);
         const latestCam = cameras.find(c => c.id === cam.id);
-        const stillHasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
-        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(cam.id)) {
+        if (latestCam && latestCam.is_active && !activeFfmpegProcesses.has(cam.id)) {
           startCameraPipeline(latestCam, fallbackFrame);
         }
       }, delay);
@@ -3381,8 +3452,9 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
       cameraFrames.set(cam.id, cur);
     } catch (e) {
       logError(e as Error, { cameraId: cam.id });
+    } finally {
+      detectionInProgress = false;
     }
-    detectionInProgress = false;
   }, 500);
 
   cameraDetectionTimers.set(cam.id, timer);
@@ -3624,26 +3696,34 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
 
     const zipPath = req.file.path;
     const errors: string[] = [];
+    const writePromises: Promise<void>[] = [];
 
     await fs.createReadStream(zipPath)
       .pipe(unzipper.Parse())
       .on("entry", (entry: any) => {
         const fileName: string = entry.path;
         if (fileName === "dev.db") {
-          entry.pipe(fs.createWriteStream(dbPath));
+          const writeStream = fs.createWriteStream(dbPath);
+          writePromises.push(new Promise(resolve => writeStream.on("finish", resolve)));
+          entry.pipe(writeStream);
         } else if (fileName.startsWith("photos/")) {
           const dest = path.join(photosDir, path.basename(fileName));
-          entry.pipe(fs.createWriteStream(dest));
+          const writeStream = fs.createWriteStream(dest);
+          writePromises.push(new Promise(resolve => writeStream.on("finish", resolve)));
+          entry.pipe(writeStream);
         } else if (fileName.startsWith("snapshots/")) {
           const dest = path.join(snapshotsDir, path.basename(fileName));
-          entry.pipe(fs.createWriteStream(dest));
+          const writeStream = fs.createWriteStream(dest);
+          writePromises.push(new Promise(resolve => writeStream.on("finish", resolve)));
+          entry.pipe(writeStream);
         } else {
           entry.autodrain();
         }
       })
       .promise();
 
-    // Cleanup temp file
+    await Promise.all(writePromises);
+
     fs.unlinkSync(zipPath);
 
     logInfo("Backup restored successfully");
@@ -3923,6 +4003,20 @@ async function seedDatabase() {
   // Load cameras from DB into in-memory array
   const camsFromDB = await prisma.camera.findMany({ orderBy: { id: "asc" } });
   cameras = camsFromDB as any[];
+
+  // Автозапуск FFmpeg + детекции для всех активных камер, чтобы камеры работали
+  // сразу после старта сервера, без ожидания WebSocket-клиента в браузере.
+  const fallbackFrame = getFallbackFrame();
+  for (const cam of cameras) {
+    if (cam.is_active && !activeFfmpegProcesses.has(cam.id)) {
+      try {
+        startCameraPipeline(cam, fallbackFrame);
+        logInfo(`Автозапуск камеры ${cam.id} (${cam.name}) при старте сервера`);
+      } catch (e) {
+        logError(e as Error, { context: `auto-start camera ${cam.id}` });
+      }
+    }
+  }
 
   // Load persons from DB into in-memory array
   const personsFromDB = await prisma.person.findMany({ include: { photos: true }, orderBy: { created_at: "desc" } });
