@@ -36,6 +36,14 @@ import {
 import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
 
+// ─── GLOBAL ERROR HANDLERS (catch unhandled rejections/exceptions) ─────────────
+process.on("uncaughtException", (err) => {
+  logError(err as Error, { context: "uncaughtException" });
+});
+process.on("unhandledRejection", (reason: any) => {
+  logError(new Error(String(reason)), { context: "unhandledRejection" });
+});
+
 // ── __filename / __dirname ────────────────────────────────────────────────────
 // tsx запускает файл как ESM-модуль → используем import.meta.url напрямую.
 // esbuild при сборке в CJS заменяет import.meta.url на require-аналог автоматически.
@@ -211,15 +219,25 @@ const upload = multer({
   storage,
   limits: {
     fileSize: 10 * 1024 * 1024, // 10 МБ
-    files: 50,
+    files: 500, // Максимум 500 файлов за один запрос
   },
-  fileFilter: (req, file, cb) => {
-    if (ALLOWED_IMAGE_MIME.has(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`Недопустимый тип файла: ${file.mimetype}`));
-    }
-  },
+}).fields([
+  { name: 'photos', maxCount: 500 }, // Файлы фото
+  { name: 'category', maxCount: 1 },  // Текстовое поле категории
+]);
+
+// Multer error middleware — перехватывает ошибки multer ДО стандартного error handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err.code === 'LIMIT_FILE_COUNT') {
+    return res.status(413).json({ detail: `Слишком много файлов. Максимум: 500` });
+  }
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ detail: 'Файл слишком большой. Максимум: 10 МБ' });
+  }
+  if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+    return res.status(400).json({ detail: `Неожиданный файл: ${err.field}` });
+  }
+  next(err);
 });
 
 // ── STATEFUL IN-MEMORY DATABASES ──
@@ -271,6 +289,7 @@ let auto_create_unknown_persons = true;
 let faiss_ivf_threshold = 1000;
 let faiss_ivf_nprobe = 10;
 let camera_priority_weights: Record<string, number> = {};
+let max_photos_per_person = 20;
 
 // Chronicle и recordings — хранятся в памяти (файловый архив, не критичные данные)
 interface Visitor {
@@ -1255,10 +1274,14 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
   try {
     const ids = req.body as number[];
     if (!Array.isArray(ids)) return res.status(400).json({ detail: "Invalid request body" });
-    // Unregister face descriptors for each person
-    await Promise.all(ids.map(id => unregisterFacePerson(id)));
+    // Unregister face descriptors for each person (skip index sync during loop)
+    await Promise.all(ids.map(id => unregisterFacePerson(id, true)));
+    // Delete persons from DB
     const deleted = await prisma.person.deleteMany({ where: { id: { in: ids } } });
+    // Sync in-memory
     persons = persons.filter((p) => !ids.includes(p.id));
+    // Single index sync after all deletions
+    await rebuildDescriptorIndex(persons);
     res.json({ success: true, count: deleted.count });
   } catch (err) {
     logError(err as Error, { path: "/api/persons/bulk_delete", method: "POST" });
@@ -1269,6 +1292,16 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
 const importJobs: Record<string, any> = {};
 const IMPORT_JOB_TTL_MS = 30 * 60 * 1000;
 
+async function enforcePhotoLimit(personId: number, additionalCount: number): Promise<{ allowed: boolean; current: number; max: number }> {
+  const total = await prisma.person.count();
+  if (total < 100) {
+    return { allowed: true, current: 0, max: 0 };
+  }
+  const current = await prisma.personPhoto.count({ where: { person_id: personId } });
+  const max = max_photos_per_person || 20;
+  return { allowed: current + additionalCount <= max, current, max };
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [jobId, job] of Object.entries(importJobs)) {
@@ -1278,13 +1311,50 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any(), (req, res) => {
+app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, res) => {
   let files: Express.Multer.File[] = [];
-  if (req.file) {
-    files.push(req.file);
-  }
-  if (req.files && Array.isArray(req.files)) {
-    files = files.concat(req.files as Express.Multer.File[]);
+  try {
+    // Multer файлы могут быть в req.files или req.file (в зависимости от upload.any())
+    try {
+      files = await new Promise<Express.Multer.File[]>((resolve, reject) => {
+        upload.any()(req, res, (err: any) => {
+          if (err) {
+            reject(err);
+          } else {
+            const result: Express.Multer.File[] = [];
+            if (req.file) result.push(req.file);
+            if (req.files) {
+              if (Array.isArray(req.files)) {
+                result.push(...req.files as Express.Multer.File[]);
+              } else if (typeof req.files === 'object') {
+                Object.values(req.files).forEach((f: any) => {
+                  if (Array.isArray(f)) result.push(...f);
+                  else result.push(f);
+                });
+              }
+            }
+            resolve(result);
+          }
+        });
+      });
+    } catch (multerErr: any) {
+      if (multerErr.code === 'LIMIT_FILE_COUNT') {
+        return res.status(413).json({ detail: `Слишком много файлов. Максимум: 200` });
+      }
+      if (multerErr.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ detail: 'Файл слишком большой. Максимум: 10 МБ' });
+      }
+      throw multerErr;
+    }
+  } catch (err: any) {
+    // Финальная обработка ошибок
+    if (err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(413).json({ detail: `Слишком много файлов. Максимум: 200` });
+    }
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ detail: 'Файл слишком большой. Максимум: 10 МБ' });
+    }
+    throw err;
   }
 
   const category = (req.body.category || 'CLIENT').toUpperCase();
@@ -1412,6 +1482,11 @@ app.post(["/api/persons/:id/photos", "/api/persons/:id/photos/"], upload.any(), 
     if (req.files && Array.isArray(req.files)) files = files.concat(req.files as Express.Multer.File[]);
     if (files.length === 0) {
       return res.status(400).json({ detail: "No file uploaded", added_embeddings: 0, total_embeddings: person.photos.length });
+    }
+
+    const limitCheck = await enforcePhotoLimit(id, files.length);
+    if (!limitCheck.allowed) {
+      return res.status(413).json({ detail: `У персоны уже ${limitCheck.current} фото. Лимит: ${limitCheck.max}` });
     }
 
     let added_embeddings = 0;
@@ -1765,6 +1840,11 @@ app.post(["/api/confirmations/:id/approve", "/api/confirmations/:id/approve/"], 
 
     const person = await prisma.person.findUnique({ where: { id: conf.person_id } });
     if (!person) return res.status(404).json({ detail: "Person not found" });
+
+    const limitCheck = await enforcePhotoLimit(conf.person_id, 1);
+    if (!limitCheck.allowed) {
+      return res.status(413).json({ detail: `У персоны уже ${limitCheck.current} фото. Лимит: ${limitCheck.max}` });
+    }
 
     const newName = `confirm_${conf.person_id}_${conf.id}_${Date.now()}.jpg`;
     const photo_path = `photos/${newName}`;
@@ -2172,7 +2252,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
     const [
       cacheEnabled, cacheTtl, qualityThreshold, adaptiveSkip,
       faissThreshold, faissNprobe, camWeights, verifyThreshold, autoCreateUnknown,
-      confirmThreshold, lowThreshold, recognitionThreshold
+      confirmThreshold, lowThreshold, recognitionThreshold, maxPhotos
     ] = await Promise.all([
       loadSetting("embedding_cache_enabled", embedding_cache_enabled),
       loadSetting("embedding_cache_ttl_days", embedding_cache_ttl_days),
@@ -2186,6 +2266,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       loadSetting("confirmation_threshold_pct", confirmation_threshold_pct),
       loadSetting("low_threshold_pct", low_threshold_pct),
       loadSetting("recognition_threshold_pct", recognition_threshold_pct),
+      loadSetting("max_photos_per_person", max_photos_per_person),
     ]);
     // Sync in-memory
     embedding_cache_enabled = cacheEnabled;
@@ -2200,6 +2281,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
     confirmation_threshold_pct = confirmThreshold;
     low_threshold_pct = lowThreshold;
     recognition_threshold_pct = recognitionThreshold;
+    max_photos_per_person = maxPhotos;
 
     res.json({
       embedding_cache_enabled,
@@ -2214,6 +2296,7 @@ app.get(["/api/settings", "/api/settings/"], async (req, res) => {
       confirmation_threshold_pct,
       low_threshold_pct,
       recognition_threshold_pct,
+      max_photos_per_person,
     });
   } catch (err) {
     logError(err as Error, { path: "/api/settings", method: "GET" });
@@ -2274,6 +2357,10 @@ app.post(["/api/settings", "/api/settings/"], async (req, res) => {
 
       low_threshold_pct = recognition_threshold_pct;
       saves.push(saveSetting("low_threshold_pct", low_threshold_pct));
+    }
+    if (req.body.max_photos_per_person !== undefined) {
+      max_photos_per_person = Math.max(1, Number(req.body.max_photos_per_person));
+      saves.push(saveSetting("max_photos_per_person", max_photos_per_person));
     }
     await Promise.all(saves);
     res.json({ ok: true, updated: Object.keys(req.body), message: "Настройки успешно сохранены" });
@@ -3807,7 +3894,11 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
   const timer = setInterval(async () => {
     if (!activeFfmpegProcesses.has(cam.id)) return;
     if (!shouldRunBySchedule()) return;
-    await runDetection();
+    try {
+      await runDetection();
+    } catch (e) {
+      logError(e as Error, { cameraId: cam.id, context: "camera detection interval" });
+    }
   }, 500);
 
   cameraDetectionTimers.set(cam.id, timer);
