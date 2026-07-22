@@ -314,17 +314,7 @@ def load_descriptors_from_sqlite(db_path: str = DB_PATH) -> List[Dict[str, Any]]
         logger.error(f"Failed to load descriptors from SQLite: {e}")
         return []
 
-# ─── Startup Auto-Index (✅ ТЕПЕРЬ 100% БЕЗОПАСНО: вызов ПОСЛЕ объявления) ───
-
-if is_initialized:
-    try:
-        initial_descriptors = load_descriptors_from_sqlite()
-        if initial_descriptors:
-            _build_faiss_index(initial_descriptors)  # ✅ ТЕПЕРЬ ЭТО РАБОТАЕТ!
-        else:
-            logger.info("No descriptors found in DB. FAISS index is empty.")
-    except Exception as e:
-        logger.error(f"Auto-index build failed: {e}")
+# ─── Startup Auto-Index (загружается внутри initialize_face_engine) ───
 
 
 # ─── Image Helpers ────────────────────────────────────────────────────────────
@@ -1062,6 +1052,16 @@ async def compare_faces(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ─── Загрузка дескрипторов при старте (после всех определений функций) ───
+try:
+    initial_descriptors = load_descriptors_from_sqlite()
+    if initial_descriptors:
+        _build_faiss_index(initial_descriptors)
+    else:
+        logger.info("No descriptors found in DB. FAISS index is empty.")
+except Exception as e:
+    logger.error(f"Auto-index build failed: {e}")
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 

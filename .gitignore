@@ -51,4 +51,7 @@ models/
 __pycache__/
 *.pyc
 *.pyo
+venv_new/
+*.egg-info/
+.pytest_cache/
 

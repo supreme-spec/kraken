@@ -11,7 +11,7 @@ import { promisify } from "util";
 
 const execAsync = promisify(exec);
 import sharp from "sharp";
-import * as archiverLib from "archiver";
+import { ZipArchive } from "archiver";
 import * as unzipper from "unzipper";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
@@ -217,7 +217,7 @@ let camera_priority_weights: Record<string, number> = {};
 // Chronicle и recordings — хранятся в памяти (файловый архив, не критичные данные)
 interface Visitor {
   filename: string;
-  person_id: number | null;
+  person_id: number | null | undefined;
   person_name: string;
   time: string;
   photo_url: string;
@@ -496,7 +496,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
             person_category: matchedPerson.category,
             person_photo_path: matchedPerson.photo_path,
             needs_operator_confirmation: !meetsVerification,
-            confirmation_status: !meetsVerification ? "pending" : null,
+    confirmation_status: meetsVerification ? undefined : "pending",
           },
         });
 
@@ -689,6 +689,48 @@ app.put("/api/cameras/:id", async (req, res) => {
   }
 });
 
+// ─── ROI Zones ────────────────────────────────────────────────────────────────
+
+app.get("/api/cameras/:id/roi", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const camera = await prisma.camera.findUnique({ where: { id } });
+    if (!camera) {
+      return res.status(404).json({ detail: "Camera not found" });
+    }
+    let zones: any[] = [];
+    if (camera.roi_zones) {
+      try {
+        zones = JSON.parse(camera.roi_zones);
+      } catch {
+        zones = [];
+      }
+    }
+    res.json({ zones });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/roi", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+app.put("/api/cameras/:id/roi", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { zones } = req.body;
+    const updated = await prisma.camera.update({
+      where: { id },
+      data: { roi_zones: JSON.stringify(zones) },
+    });
+    // Sync in-memory
+    const index = cameras.findIndex((c) => c.id === id);
+    if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+    res.json({ success: true, zones });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/roi", method: "PUT" });
+    res.status(404).json({ detail: "Camera not found" });
+  }
+});
+
 app.delete(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -703,16 +745,24 @@ app.delete(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
 
 app.get("/api/cameras/:id/snapshot", (req, res) => {
   const id = parseInt(req.params.id);
-  let imageBuffer: Buffer;
   const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
   const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
 
-  if (fs.existsSync(rusSrc)) {
-    imageBuffer = fs.readFileSync(rusSrc);
-  } else if (fs.existsSync(logoSrc)) {
-    imageBuffer = fs.readFileSync(logoSrc);
+  // Пытаемся найти последний снимок камеры в папке snapshots
+  const cameraSnapshots = cameras.find(c => c.id === id);
+  let imageBuffer: Buffer;
+  
+  if (cameraSnapshots && cameraSnapshots.snapshot_path) {
+    const fullPath = path.join(process.cwd(), "public", cameraSnapshots.snapshot_path);
+    if (fs.existsSync(fullPath)) {
+      imageBuffer = fs.readFileSync(fullPath);
+    } else {
+      // Fallback на rus.jpg
+      imageBuffer = fs.existsSync(rusSrc) ? fs.readFileSync(rusSrc) : fs.readFileSync(logoSrc);
+    }
   } else {
-    imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+    // Fallback на rus.jpg
+    imageBuffer = fs.existsSync(rusSrc) ? fs.readFileSync(rusSrc) : fs.readFileSync(logoSrc);
   }
 
   res.json({
@@ -2577,7 +2627,7 @@ function recordToChronicle(rec: any) {
 }
 
 /** Добавляет посетителя в in-memory «Хронику» (вкладка Архив фото). */
-function recordVisitor(cameraId: number, person_id: number | null, person_name: string, snapshot_path: string) {
+function recordVisitor(cameraId: number, person_id: number | null | undefined, person_name: string, snapshot_path: string) {
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
@@ -2695,7 +2745,7 @@ function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: st
 async function persistAndBroadcastEvent(e: {
   cameraId: number;
   cameraName: string;
-  personId?: number;
+  personId?: number | null;
   event_type: string;
   confidence: number;
   snapshot_path: string;
@@ -2703,7 +2753,7 @@ async function persistAndBroadcastEvent(e: {
   person_category?: string;
   person_photo_path?: string;
   needs_operator_confirmation?: boolean;
-  confirmation_status?: string;
+  confirmation_status?: string | null;
   confirmationId?: number;
 }) {
   try {
@@ -2781,7 +2831,7 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
     person_category: match.category,
     person_photo_path: person?.photo_path,
     needs_operator_confirmation: !meetsVerification,
-    confirmation_status: !meetsVerification ? "pending" : null,
+    confirmation_status: meetsVerification ? null : "pending",
   });
 
   triggerSmartRecording(cam);
@@ -2921,7 +2971,7 @@ async function createUnknownPersonFromFace(
 async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
   const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id);
 
-  let personId: number | null = null;
+  let personId: number | undefined = undefined;
   let personName: string | null = null;
   let personCategory = "CLIENT";
   let personPhotoPath: string | undefined;
@@ -2948,7 +2998,7 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
 
   // Пишем посетителя в хронику ПОСЛЕ разрешения личности: если дедуп нашёл
   // существующего человека, запись привяжется к нему, а не к абстрактному «Неизвестный».
-  recordVisitor(cam.id, personId, personName || "Неизвестный", snapshot_path);
+  recordVisitor(cam.id, personId || null, personName || "Неизвестный", snapshot_path);
 
   await persistAndBroadcastEvent({
     cameraId: cam.id,
@@ -3536,9 +3586,7 @@ app.post(["/api/backup", "/api/backup/"], async (req, res) => {
 
     // Создаём ZIP архив с БД и медиафайлами
     const output = fs.createWriteStream(backupPath);
-    const archive = (archiverLib as any).default
-      ? (archiverLib as any).default("zip", { zlib: { level: 6 } })
-      : (archiverLib as any)("zip", { zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 6 } });
 
     await new Promise<void>((resolve, reject) => {
       output.on("close", resolve);
