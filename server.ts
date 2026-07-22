@@ -579,7 +579,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
           camera_id: camera.id,
           camera_name: camera.name,
           event_type: "UNKNOWN",
-          confidence: confidence || 0.5,
+          confidence: 0,
           snapshot_path,
           person_name: personName || "Неизвестный",
           person_category: "CLIENT",
@@ -590,7 +590,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
         category: "CLIENT",
         person_name: personName || "Неизвестный",
         camera_id: camera.id,
-        confidence: confidence || 0.5,
+        confidence: 0,
         snapshot_path,
         timestamp: new Date().toISOString(),
       });
@@ -3220,7 +3220,8 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         bbox,
         person_id: undefined,
         category: "UNKNOWN",
-        confidence: f.score || 0,
+        confidence: 0,
+        detection_score: f.score,
         box: f.box,
       });
       const key = `${cam.id}:unknown`;
