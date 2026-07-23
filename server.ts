@@ -895,11 +895,11 @@ app.get("/api/cameras/:id/snapshot", (req, res) => {
     imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
   }
 
+  res.setHeader("Cache-Control", "no-store");
   res.json({
     image: imageBuffer.toString("base64"),
     content_type: "image/jpeg",
   });
-  res.setHeader("Cache-Control", "no-store");
 });
 
 app.post("/api/cameras/:id/capture", (req, res) => {
@@ -1033,14 +1033,14 @@ app.get(["/api/persons", "/api/persons/"], async (req, res) => {
     const where: any = {};
     const nameContains = (req.query.name_contains as string || "").trim();
     if (nameContains) {
-      where.name = { contains: nameContains, mode: "insensitive" };
+      where.name = { contains: nameContains };
     } else {
       if (category) where.category = category;
       if (search) {
         where.OR = [
-          { name: { contains: search, mode: "insensitive" } },
-          { comment: { contains: search, mode: "insensitive" } },
-          { organization: { contains: search, mode: "insensitive" } },
+          { name: { contains: search } },
+          { comment: { contains: search } },
+          { organization: { contains: search } },
         ];
       }
     }
@@ -1065,17 +1065,17 @@ app.get(["/api/persons/check_duplicate", "/api/persons/check_duplicate/"], async
       return res.json({ duplicate: false, matches: [] });
     }
 
-     const matches = await prisma.person.findMany({
-       where: {
-         name: { contains: name, mode: "insensitive" } as any
-       },
-       select: {
-         id: true,
-         name: true,
-         category: true
-       } as any,
-       take: 20
-     });
+      const matches = await prisma.person.findMany({
+        where: {
+          name: { contains: name }
+        },
+        select: {
+          id: true,
+          name: true,
+          category: true
+        },
+        take: 20
+      });
 
     res.json({
       duplicate: matches.length > 0,
@@ -1413,7 +1413,7 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, 
 
         // Ищем существующую персону в БД (case-insensitive для SQLite)
         const existingPersons = await prisma.person.findMany({
-          where: { name: { equals: cleanName, mode: "insensitive" } } as any,
+          where: { name: { equals: cleanName } },
           include: { photos: true },
           take: 1,
         });
@@ -3006,7 +3006,7 @@ async function persistAndBroadcastEvent(e: {
   confirmation_status?: string | null;
   confirmationId?: number;
 }) {
-  try {
+   try {
     await prisma.event.create({
       data: {
         camera_id: e.cameraId,
@@ -3023,20 +3023,26 @@ async function persistAndBroadcastEvent(e: {
         confirmation_id: e.confirmationId ?? null,
       },
     });
-    broadcastSecurity({
-      type: "ALERT",
-      category: (e.person_category as any) || "UNKNOWN",
-      person_id: e.personId ?? 0,
-      person_name: e.person_name || "Неизвестный",
-      camera_id: e.cameraId,
-      confidence: e.confidence,
-      snapshot_path: e.snapshot_path,
-      timestamp: new Date().toISOString(),
-    });
-    broadcastSecurity({ type: "EVENT" });
-  } catch (err) {
+  } catch (err: any) {
+    if (err.code === "P2003") {
+      logWarn(`[Event] FK violation: camera_id=${e.cameraId} person_id=${e.personId} — event skipped`);
+      return;
+    }
     logError(err as Error, { context: "persist recognition event" });
+    return;
   }
+
+  broadcastSecurity({
+    type: "ALERT",
+    category: (e.person_category as any) || "UNKNOWN",
+    person_id: e.personId ?? 0,
+    person_name: e.person_name || "Неизвестный",
+    camera_id: e.cameraId,
+    confidence: e.confidence,
+    snapshot_path: e.snapshot_path,
+    timestamp: new Date().toISOString(),
+  });
+  broadcastSecurity({ type: "EVENT" });
 }
 
 /** Запускает ограниченную запись (клип) при срабатывании события, если включена умная запись. */
@@ -3105,6 +3111,10 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
 async function cropFaceFromFrame(frameBase64: string, box: any): Promise<Buffer | null> {
   try {
     const buf = Buffer.from(frameBase64, "base64");
+    if (!buf || buf.length === 0) {
+      logWarn("[Crop] Empty frame buffer received. Skipping crop.");
+      return null;
+    }
     const meta = await sharp(buf).metadata();
     const iw = meta.width || 640;
     const ih = meta.height || 480;
