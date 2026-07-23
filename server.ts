@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, exec, ChildProcessWithoutNullStreams } from "child_process";
 import { promisify } from "util";
+import { handleCameraWebhook, type CameraConfig } from "./server/cameraWebhookHandler.js";
 
 const execAsync = promisify(exec);
 import sharp from "sharp";
