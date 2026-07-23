@@ -116,22 +116,69 @@ def verify_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
 
 # ─── GPU Provider Selection ───────────────────────────────────────────────────
 
+
+class _SuppressStderr:
+    def __enter__(self):
+        self._original_stderr = None
+        try:
+            import sys
+
+            self._original_stderr = sys.stderr
+            sys.stderr = open(os.devnull, "w")
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            import sys
+
+            if self._original_stderr is not None:
+                sys.stderr = self._original_stderr
+        except Exception:
+            pass
+
+
+def _suppress_onnx_logs() -> None:
+    try:
+        import onnxruntime as _ort
+
+        _ort.set_default_logger_severity(4)
+    except Exception:
+        pass
+
+
+def _verify_provider(provider: str) -> bool:
+    """Quick sanity check that ONNX Runtime provider can be initialized."""
+    if provider == "CPUExecutionProvider":
+        return True
+    _suppress_onnx_logs()
+    try:
+        import onnxruntime as ort
+
+        return provider in ort.get_available_providers()
+    except Exception:
+        return False
+
+
 def get_optimal_providers() -> List[str]:
     """Determines best available GPU acceleration."""
+    _suppress_onnx_logs()
     import onnxruntime as ort
+
     available_providers = ort.get_available_providers()
     providers: List[str] = []
 
-    if "CUDAExecutionProvider" in available_providers:
+    if "CUDAExecutionProvider" in available_providers and _verify_provider("CUDAExecutionProvider"):
         providers.append("CUDAExecutionProvider")
         logger.info("NVIDIA GPU detected. Using CUDA.")
-    elif "DmlExecutionProvider" in available_providers:
+    elif "DmlExecutionProvider" in available_providers and _verify_provider("DmlExecutionProvider"):
         providers.append("DmlExecutionProvider")
         logger.info("AMD/Intel GPU detected. Using DirectML.")
-    elif "OpenVINOExecutionProvider" in available_providers:
+    elif "OpenVINOExecutionProvider" in available_providers and _verify_provider("OpenVINOExecutionProvider"):
         providers.append("OpenVINOExecutionProvider")
         logger.info("Intel GPU/CPU detected. Using OpenVINO.")
-    elif "ROCMExecutionProvider" in available_providers:
+    elif "ROCMExecutionProvider" in available_providers and _verify_provider("ROCMExecutionProvider"):
         providers.append("ROCMExecutionProvider")
         logger.info("AMD GPU detected. Using ROCm.")
     else:
@@ -147,45 +194,58 @@ def initialize_face_engine() -> Tuple[Any, str]:
     """Initializes InsightFace with smart fallback."""
     used_provider_local = "CPUExecutionProvider"
     try:
-        import insightface
-        import onnxruntime as ort
-        target_providers = get_optimal_providers()
-        ort.set_default_logger_severity(3)
-
-        if target_providers == ["CPUExecutionProvider"]:
-            logger.info("Initializing InsightFace on CPU...")
-            app_instance = insightface.app.FaceAnalysis(
-                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
-            )
-            app_instance.prepare(ctx_id=-1, det_size=(640, 640))
-            logger.info("InsightFace loaded on CPU.")
-            return app_instance, "CPUExecutionProvider"
-
-        try:
-            logger.info(f"Attempting GPU initialization with: {target_providers[:-1]}")
-            app_instance = insightface.app.FaceAnalysis(
-                name="buffalo_l", root=str(MODELS_DIR), providers=target_providers
-            )
-            app_instance.prepare(ctx_id=0, det_size=(640, 640))
-            used_provider_local = target_providers[0]
-            logger.info(f"InsightFace loaded on {used_provider_local}.")
-            return app_instance, used_provider_local
-        except Exception as e:
-            logger.error(f"GPU initialization failed: {e}")
-            logger.warning("Falling back to CPU...")
-            app_instance = insightface.app.FaceAnalysis(
-                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
-            )
-            app_instance.prepare(ctx_id=-1, det_size=(640, 640))
-            logger.info("InsightFace loaded on CPU (compatibility mode).")
-            return app_instance, "CPUExecutionProvider"
-
+        with _SuppressStderr():
+            return _initialize_face_engine_impl()
     except Exception as e:
         logger.error(f"Fatal initialization error: {e}")
         import traceback
         traceback.print_exc()
         logger.error("Running in demo mode (no AI).")
         return None, "none"
+
+
+def _initialize_face_engine_impl() -> Tuple[Any, str]:
+    used_provider_local = "CPUExecutionProvider"
+    import insightface
+    import onnxruntime as ort
+    target_providers = get_optimal_providers()
+    _suppress_onnx_logs()
+
+    if target_providers == ["CPUExecutionProvider"] or not _verify_provider(target_providers[0]):
+        logger.info("Initializing InsightFace on CPU...")
+        app_instance = insightface.app.FaceAnalysis(
+            name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+        )
+        app_instance.prepare(ctx_id=-1, det_size=(640, 640))
+        logger.info("InsightFace loaded on CPU.")
+        return app_instance, "CPUExecutionProvider"
+
+    try:
+        logger.info(f"Attempting GPU initialization with: {target_providers[:-1]}")
+        app_instance = insightface.app.FaceAnalysis(
+            name="buffalo_l", root=str(MODELS_DIR), providers=target_providers
+        )
+        app_instance.prepare(ctx_id=0, det_size=(640, 640))
+
+        try:
+            first_model = next(iter(app_instance.models.values()))
+            actual_providers = getattr(getattr(first_model, "session", None), "get_providers", lambda: [])()
+            actual = actual_providers[0] if actual_providers else target_providers[0]
+        except Exception:
+            actual = target_providers[0]
+
+        used_provider_local = actual
+        logger.info(f"InsightFace loaded on {used_provider_local}.")
+        return app_instance, used_provider_local
+    except Exception as e:
+        logger.error(f"GPU initialization failed: {e}")
+        logger.warning("Falling back to CPU...")
+        app_instance = insightface.app.FaceAnalysis(
+            name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+        )
+        app_instance.prepare(ctx_id=-1, det_size=(640, 640))
+        logger.info("InsightFace loaded on CPU (compatibility mode).")
+        return app_instance, "CPUExecutionProvider"
 
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
@@ -676,7 +736,7 @@ async def detect_faces(
         logger.error(f"Detection error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/assess-quality", dependencies=[Depends(verify_api_key)])
@@ -752,7 +812,7 @@ async def assess_quality(image: UploadFile = File(...)):
         logger.error(f"Quality assessment error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/get-embedding", dependencies=[Depends(verify_api_key)])
@@ -817,7 +877,7 @@ async def get_embedding(
         logger.error(f"Embedding error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/recognize", dependencies=[Depends(verify_api_key)])
@@ -925,7 +985,7 @@ async def recognize(
         logger.error(f"Recognition error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/recognize-by-descriptor", dependencies=[Depends(verify_api_key)])
@@ -1024,7 +1084,7 @@ async def recognize_by_descriptor(
         logger.error(f"Descriptor recognition error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/update-index", dependencies=[Depends(verify_api_key)])
@@ -1048,7 +1108,7 @@ async def update_index(payload: Dict[str, Any]):
         logger.error(f"Index update error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/compare-faces", dependencies=[Depends(verify_api_key)])
@@ -1069,7 +1129,7 @@ async def compare_faces(
         logger.error(f"Comparison error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ─── Загрузка дескрипторов при старте (после всех определений функций) ───

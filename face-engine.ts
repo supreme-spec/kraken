@@ -29,6 +29,9 @@ const HEALTH_CHECK_TIMEOUT_MS = Number(process.env.FACE_HEALTH_CHECK_TIMEOUT) ||
 // Embedding cache
 const EMBEDDING_CACHE_TTL_MS = Number(process.env.FACE_EMBEDDING_CACHE_TTL) || 5 * 60 * 1000; // 5 мин
 
+// Periodic cache cleanup
+let pruneTimer: ReturnType<typeof setInterval> | null = null;
+
 // Path traversal protection
 const MAX_PATH_DEPTH = 10;
 
@@ -172,11 +175,36 @@ function startHealthCheckTimer(): void {
   }
 }
 
+/** Запускает периодическую очистку кэша эмбеддингов */
+function startPruneTimer(): void {
+  if (pruneTimer) return;
+
+  pruneTimer = setInterval(() => {
+    try {
+      pruneEmbeddingCache();
+    } catch (err) {
+      logError(err as Error, { context: "Prune embedding cache timer" });
+    }
+  }, 60_000);
+
+  if (pruneTimer.unref) {
+    pruneTimer.unref();
+  }
+}
+
 /** Останавливает периодический health check */
 function stopHealthCheckTimer(): void {
   if (healthCheckTimer) {
     clearInterval(healthCheckTimer);
     healthCheckTimer = null;
+  }
+}
+
+/** Останавливает периодическую очистку кэша */
+function stopPruneTimer(): void {
+  if (pruneTimer) {
+    clearInterval(pruneTimer);
+    pruneTimer = null;
   }
 }
 
@@ -517,6 +545,7 @@ export async function initFaceEngine(): Promise<boolean> {
     logInfo("Инициализация FaceEngine v3.0...");
     await loadDescriptorsFromDB();
     startHealthCheckTimer();
+    startPruneTimer();
     await checkPythonServerHealth(); // первая проверка при старте
     logInfo("FaceEngine v3.0 готов к работе!");
     isInitialized = true;
