@@ -66,6 +66,38 @@ ENABLE_PREPROCESS: bool = os.getenv("FACE_ENABLE_PREPROCESS", "1") not in ("0", 
 API_KEY: str = os.getenv("FACE_API_KEY", "")
 DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
 
+# ─── Zone filters (fraction of frame width/height) ─────────────────────────────
+# Passage ROI where the guest should appear.
+PASSAGE_ROI = {
+    "x_min": 0.30,
+    "x_max": 0.65,
+    "y_min": 0.10,
+    "y_max": 0.80,
+}
+# Left-side ignore zone where the guard stands.
+GUARD_IGNORE_ZONE = {
+    "x_min": 0.00,
+    "x_max": 0.30,
+    "y_min": 0.00,
+    "y_max": 1.00,
+}
+
+def is_valid_face_position(face_bbox, frame_width: int, frame_height: int) -> bool:
+    x1, y1, x2, y2 = [int(v) for v in face_bbox[:4]]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    nx = cx / max(1, frame_width)
+    ny = cy / max(1, frame_height)
+    in_passage = (
+        PASSAGE_ROI["x_min"] <= nx <= PASSAGE_ROI["x_max"]
+        and PASSAGE_ROI["y_min"] <= ny <= PASSAGE_ROI["y_max"]
+    )
+    in_guard = (
+        GUARD_IGNORE_ZONE["x_min"] <= nx <= GUARD_IGNORE_ZONE["x_max"]
+        and GUARD_IGNORE_ZONE["y_min"] <= ny <= GUARD_IGNORE_ZONE["y_max"]
+    )
+    return in_passage and not in_guard
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="[FaceEngine] %(levelname)s: %(message)s")
@@ -913,13 +945,27 @@ async def recognize(
         if not valid_faces:
             return {"matches": [], "status": "no_valid_faces"}
 
-        primary_face = valid_faces[0]
+        h, w = img.shape[:2]
+        zoned_faces = [f for f in valid_faces if is_valid_face_position(f.bbox, w, h)]
+        primary_face = zoned_faces[0] if zoned_faces else valid_faces[0]
         if not hasattr(primary_face, "embedding") or primary_face.embedding is None:
             return {"matches": [], "status": "no_embedding"}
 
         embedding = np.array(primary_face.embedding, dtype=np.float32)
         candidates = get_faiss_matches(embedding, top_k=top_k)
         effective_threshold = threshold if threshold is not None else RECOGNITION_THRESHOLD
+
+        box = primary_face.bbox.astype(int).tolist()
+        face_crop = _crop_face_region(img, primary_face.bbox)
+        sharpness = estimate_sharpness(face_crop)
+        face_area = max(1, (int(box[2]) - int(box[0]))) * max(1, (int(box[3]) - int(box[1])))
+        quality_score = float(sharpness) * float(face_area)
+        face_bbox = {
+            "x": int(box[0]),
+            "y": int(box[1]),
+            "width": int(box[2]) - int(box[0]),
+            "height": int(box[3]) - int(box[1]),
+        }
 
         matches: List[Dict[str, Any]] = []
         needs_confirmation_data = None
@@ -973,6 +1019,9 @@ async def recognize(
             "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
             "best_similarity": best_sim,
+            "face_bbox": face_bbox,
+            "sharpness": sharpness,
+            "quality_score": quality_score,
         }
 
         if needs_confirmation_data and not matches:

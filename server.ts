@@ -8,9 +8,9 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, exec, ChildProcessWithoutNullStreams } from "child_process";
 import { promisify } from "util";
-import { handleCameraWebhook, ALLOWED_CAMERA_IPS, type CameraConfig } from "./server/cameraWebhookHandler.js";
 
 const execAsync = promisify(exec);
+import axios from "axios";
 import sharp from "sharp";
 import { ZipArchive } from "archiver";
 import * as unzipper from "unzipper";
@@ -120,7 +120,7 @@ function apiKeyAuth(req: any, res: any, next: any) {
   return res.status(401).json({ detail: "Unauthorized: требуется API_KEY" });
 }
 
-function getCameraConfig(ip: string): CameraConfig | null {
+function getCameraConfig(ip: string): any | null {
   const cleanIp = ip.replace(/^::ffff:/i, "");
   const cam = cameras.find((c) => {
     const camIp = c.ip_address || new URL(c.source).hostname;
@@ -146,6 +146,27 @@ function getCameraConfig(ip: string): CameraConfig | null {
   };
 }
 
+const ALLOWED_CAMERA_IPS = new Set<string>([
+  // Uniview
+  '192.168.1.50',
+  '192.168.1.51',
+  '192.168.1.52',
+  // Hikvision
+  '192.168.1.60',
+  '192.168.1.61',
+  '192.168.1.62',
+]);
+
+const webhookCooldown = new Map<string, number>();
+const COOLDOWN_MS = 3000;
+
+const SNAPSHOT_PATHS = {
+  hikvision: '/ISAPI/Streaming/channels/101/picture',
+  uniview: '/images/snapshot.jpg',
+};
+
+const TRIGGER_KEYWORDS = ['face', 'human', 'vmd', 'regionentrance', 'linedetection', 'intelligent', 'alarm'];
+
 app.post(
   ["/webhooks/camera", "/webhooks/camera/"],
   express.text({ type: ["application/xml", "application/json", "text/plain"] }),
@@ -158,23 +179,164 @@ app.post(
         return res.status(403).send("Forbidden");
       }
 
-      const result = await handleCameraWebhook(req.body, req.headers["content-type"], clientIp, getCameraConfig);
-
-      if (!result.success) {
-        return res.status(200).json({ success: false, reason: result.reason });
+      const now = Date.now();
+      const lastTime = webhookCooldown.get(clientIp) || 0;
+      if (now - lastTime < COOLDOWN_MS) {
+        return res.status(200).send("OK");
       }
 
-      if (!result.cameraId) {
-        return res.status(200).json({ success: false, reason: "camera_not_found" });
+      const payload = typeof req.body === "string" ? req.body.toLowerCase() : JSON.stringify(req.body).toLowerCase();
+      const isTrigger = TRIGGER_KEYWORDS.some((keyword) => payload.includes(keyword));
+      if (!isTrigger) {
+        return res.status(200).send("OK");
       }
 
-      return res.status(200).json({ success: true, camera_id: result.cameraId, processed: true });
+      const camera = cameras.find((c) => c.ip_address === clientIp);
+      if (!camera) {
+        logWarn(`[Webhook] Камера с IP ${clientIp} не найдена в базе`);
+        return res.status(404).send("Camera not found");
+      }
+
+      webhookCooldown.set(clientIp, now);
+      logInfo(`[Webhook] Детекция от ${camera.camera_type} камеры ${camera.name} (${clientIp})`);
+
+      const snapshotBuffer = await fetchSnapshotFromCamera(camera);
+      if (!snapshotBuffer) {
+        logError(new Error(`Не удалось получить снимок с камеры ${clientIp}`), { context: "webhook-pull" });
+        return res.status(200).send("OK");
+      }
+
+      res.status(200).send("OK");
+
+      processRecognitionInBackground(camera, snapshotBuffer).catch((err) => {
+        logError(err, { context: "Background recognition processing" });
+      });
     } catch (err) {
       logError(err as Error, { context: "universal camera webhook" });
-      return res.status(200).json({ error: "Failed to process webhook" });
+      return res.status(200).send("OK");
     }
   }
 );
+
+async function fetchSnapshotFromCamera(camera: any): Promise<Buffer | null> {
+  const brand = (camera.camera_type || "").toLowerCase().includes("unv") ? "uniview" : "hikvision";
+  const snapshotPath = SNAPSHOT_PATHS[brand];
+  const auth = camera.username && camera.password ? { username: camera.username, password: camera.password } : undefined;
+
+  try {
+    const url = `http://${camera.ip_address}${snapshotPath}`;
+    const response = await axios.get(url, {
+      responseType: "arraybuffer",
+      auth,
+      timeout: 2500,
+      maxRedirects: 0,
+    } as any);
+
+    const buffer = Buffer.from(response.data as ArrayBuffer);
+    if (buffer.length > 2 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+      logDebug(`[Snapshot] Успешно получен с ${camera.ip_address} по пути ${snapshotPath}`);
+      return buffer;
+    }
+  } catch (err) {
+    // ignore
+  }
+  return null;
+}
+
+async function processRecognitionInBackground(camera: any, snapshotBuffer: Buffer) {
+  try {
+    const FormDataCtor = (globalThis as any).FormData;
+    if (!FormDataCtor) {
+      throw new Error("FormData is not available in this environment");
+    }
+
+    const form = new FormDataCtor();
+    form.append("image", snapshotBuffer, { filename: "snapshot.jpg", contentType: "image/jpeg" });
+    form.append("camera_id", String(camera.id));
+
+    const faceServerUrl = process.env.FACE_SERVER_URL || "http://localhost:8001";
+    const recognitionRes = await axios.post(`${faceServerUrl}/recognize`, form, {
+      headers: (form as any).getHeaders ? (form as any).getHeaders() : {},
+      timeout: 3000,
+    });
+
+    const result: any = recognitionRes.data;
+
+    if (result.status === "ok" && result.matches && result.matches.length > 0) {
+      const bestMatch = result.matches[0];
+      logInfo(`✅ Распознан: ${bestMatch.person_name} (${(bestMatch.similarity * 100).toFixed(1)}%) на ${camera.name}`);
+
+      const targetFilename = `${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
+      const targetPath = path.join(snapshotsDir, targetFilename);
+      await fs.promises.writeFile(targetPath, snapshotBuffer);
+      const savedSnapshotPath = `snapshots/${targetFilename}`;
+
+      const metaFilename = `${path.basename(targetFilename, '.jpg')}.json`;
+      const metaPath = path.join(snapshotsDir, metaFilename);
+      await fs.promises.writeFile(metaPath, JSON.stringify({
+        timestamp: new Date().toISOString(),
+        camera_id: camera.id,
+        camera_name: camera.name,
+        person_id: bestMatch.person_id ?? null,
+        person_name: bestMatch.person_name,
+        category: bestMatch.category,
+        confidence: bestMatch.similarity,
+        face_bbox: result.face_bbox || null,
+        sharpness: result.sharpness ?? null,
+        quality_score: result.quality_score ?? null,
+        snapshot_path: savedSnapshotPath,
+      }, null, 2));
+
+      let matchedPerson: any = null;
+      if (bestMatch.person_id) {
+        matchedPerson = await prisma.person.findUnique({ where: { id: bestMatch.person_id } });
+      }
+
+      if (matchedPerson) {
+        await prisma.person.update({
+          where: { id: matchedPerson.id },
+          data: { visit_count: { increment: 1 }, last_seen_at: new Date() },
+        });
+
+        let event_type = "RECOGNIZED";
+        if (matchedPerson.category === "VIP") event_type = "VIP_ARRIVAL";
+        else if (matchedPerson.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
+        else if (matchedPerson.category === "RESPONSE") event_type = "RESPONSE_ALERT";
+
+        await prisma.event.create({
+          data: {
+            camera_id: camera.id,
+            camera_name: camera.name,
+            person_id: matchedPerson.id,
+            event_type,
+            confidence: bestMatch.similarity,
+            snapshot_path: savedSnapshotPath,
+            person_name: matchedPerson.name,
+            person_category: matchedPerson.category,
+            person_photo_path: matchedPerson.photo_path,
+          },
+        });
+
+        broadcastSecurity({
+          type: "ALERT",
+          category: matchedPerson.category,
+          person_id: matchedPerson.id,
+          person_name: matchedPerson.name,
+          camera_id: camera.id,
+          confidence: bestMatch.similarity,
+          snapshot_path: savedSnapshotPath,
+          timestamp: new Date().toISOString(),
+        });
+        broadcastSecurity({ type: "EVENT" });
+      }
+    } else {
+      logInfo(`⚠️ Лицо обнаружено, но не распознано на ${camera.name}`);
+    }
+  } catch (err: any) {
+    logError(err, { context: "Background recognition processing" });
+  }
+}
+
 
 app.use("/api", apiKeyAuth);
 
