@@ -3289,6 +3289,86 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
   triggerSmartRecording(cam);
 }
 
+// ─── Face tracking across frames ───────────────────────────────────────────────
+
+interface TrackedFace {
+  trackId: string;
+  descriptor: number[];
+  bbox: [number, number, number, number];
+  lastSeen: number;
+  personId?: number;
+}
+
+const trackedFacesByCamera = new Map<number, Map<string, TrackedFace>>();
+const TRACK_TIMEOUT = 5000;
+const TRACK_SIM_THRESHOLD = 0.65;
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length && i < b.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom > 1e-12 ? dot / denom : 0;
+}
+
+function pruneStaleTracks(cameraId: number): void {
+  const tracks = trackedFacesByCamera.get(cameraId);
+  if (!tracks) return;
+  const now = Date.now();
+  for (const [id, track] of tracks.entries()) {
+    if (now - track.lastSeen > TRACK_TIMEOUT) {
+      tracks.delete(id);
+    }
+  }
+}
+
+function findOrCreateTrack(
+  cameraId: number,
+  descriptor: number[],
+  bbox: [number, number, number, number],
+  match: any
+): { trackId: string; isNew: boolean } {
+  let tracks = trackedFacesByCamera.get(cameraId);
+  if (!tracks) {
+    tracks = new Map();
+    trackedFacesByCamera.set(cameraId, tracks);
+  }
+  pruneStaleTracks(cameraId);
+
+  let bestTrackId: string | null = null;
+  let bestSim = TRACK_SIM_THRESHOLD;
+  for (const [id, track] of tracks.entries()) {
+    const sim = cosineSimilarity(descriptor, track.descriptor);
+    if (sim > bestSim) {
+      bestSim = sim;
+      bestTrackId = id;
+    }
+  }
+
+  if (bestTrackId) {
+    const track = tracks.get(bestTrackId)!;
+    track.lastSeen = Date.now();
+    track.bbox = bbox;
+    if (match && match.personId) track.personId = match.personId;
+    return { trackId: bestTrackId, isNew: false };
+  }
+
+  const trackId = `track_${cameraId}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  tracks.set(trackId, {
+    trackId,
+    descriptor,
+    bbox,
+    lastSeen: Date.now(),
+    personId: match?.personId,
+  });
+  return { trackId, isNew: true };
+}
+
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
 async function processDetectedFaces(cam: any, frameBase64: string, faces: any[], debug = false): Promise<any[]> {
   const roiZones = debug ? [] : parseRoiZones(cam);
@@ -3312,6 +3392,11 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
     if (!debug && h < VISIT_MIN_FACE_SIZE_PX) continue;
 
     const desc = f.descriptor;
+    let trackMeta = { trackId: String(i + 1), isNew: true };
+    if (desc && desc.length) {
+      const normalizedDesc = Array.isArray(desc) ? desc : Array.from(desc);
+      trackMeta = findOrCreateTrack(cam.id, normalizedDesc, bbox, null);
+    }
 
     let match: any = null;
     if (desc && desc.length) {
@@ -3323,7 +3408,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
     if (match && sim >= confirmT) {
       if (isIgnoredCategory(match.category)) {
         enriched.push({
-          track_id: i + 1,
+          track_id: trackMeta.trackId,
           bbox,
           person_id: match.personId,
           person_name: match.personName,
@@ -3337,7 +3422,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
 
       if (!debug && isPersonInCurrentVisitWindow(match.personId)) {
         enriched.push({
-          track_id: i + 1,
+          track_id: trackMeta.trackId,
           bbox,
           person_id: match.personId,
           person_name: match.personName,
@@ -3352,7 +3437,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
       await maybeRecordVisit(cam, match.personId, match, frameBase64);
 
       enriched.push({
-        track_id: i + 1,
+        track_id: trackMeta.trackId,
         bbox,
         person_id: match.personId,
         person_name: match.personName,
@@ -3363,7 +3448,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
     } else if (match && sim >= minThreshold) {
       if (isIgnoredCategory(match.category)) {
         enriched.push({
-          track_id: i + 1,
+          track_id: trackMeta.trackId,
           bbox,
           person_id: match.personId,
           person_name: match.personName,
@@ -3377,7 +3462,7 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
       }
 
       enriched.push({
-        track_id: i + 1,
+        track_id: trackMeta.trackId,
         bbox,
         person_id: match.personId,
         person_name: match.personName,
@@ -3387,38 +3472,27 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
         needs_confirmation: true,
       });
       const key = `${cam.id}:conf${match.personId}`;
-      if (debug || Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
+      if (debug || trackMeta.isNew || Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
         await handleConfirmationEvent(cam, match, frameBase64, f);
       }
     } else {
       const faceHash = Buffer.from(JSON.stringify(f.descriptor || [])).toString("base64").slice(0, 64);
       const now = Date.now();
-      if (!debug && unknownFaceCooldowns.has(faceHash) && now - (unknownFaceCooldowns.get(faceHash) || 0) < UNKNOWN_COOLDOWN_MS) {
-        enriched.push({
-          track_id: i + 1,
-          bbox,
-          person_id: undefined,
-          category: "UNKNOWN",
-          confidence: 0,
-          detection_score: f.score,
-          box: f.box,
-          is_duplicate_unknown: true,
-        });
-        continue;
-      }
-
+      const isDuplicateUnknown = !debug && unknownFaceCooldowns.has(faceHash) && now - (unknownFaceCooldowns.get(faceHash) || 0) < UNKNOWN_COOLDOWN_MS;
       enriched.push({
-        track_id: i + 1,
+        track_id: trackMeta.trackId,
         bbox,
         person_id: undefined,
         category: "UNKNOWN",
         confidence: 0,
         detection_score: f.score,
         box: f.box,
+        is_duplicate_unknown: isDuplicateUnknown || !trackMeta.isNew,
       });
+      if (isDuplicateUnknown) continue;
       const key = `${cam.id}:unknown`;
-      if (debug || Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
+      if (debug || trackMeta.isNew || Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
         unknownFaceCooldowns.set(faceHash, now);
         await handleUnknownEvent(cam, frameBase64, f);
