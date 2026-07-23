@@ -1,9 +1,22 @@
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 import { XMLParser } from 'fast-xml-parser';
 
-// --- КОНФИГУРАЦИЯ ---
+// ─── КОНФИГУРАЦИЯ ─────────────────────────────────────────────────────────────
 const COOLDOWN_MS = 3000;
 const SNAPSHOT_TIMEOUT_MS = 2500;
+const RECOGNITION_TIMEOUT_MS = 5000;
+
+// Заполните реальными IP ваших 18 камер
+export const ALLOWED_CAMERA_IPS = new Set<string>([
+  // Uniview
+  '192.168.1.50',
+  '192.168.1.51',
+  '192.168.1.52',
+  // Hikvision
+  '192.168.1.60',
+  '192.168.1.61',
+  '192.168.1.62',
+]);
 
 const SNAPSHOT_PATHS = {
   hikvision: [
@@ -18,10 +31,17 @@ const SNAPSHOT_PATHS = {
   ],
 };
 
-const TRIGGER_KEYWORDS = ['face', 'human', 'vmd', 'regionentrance', 'regionexiting', 'linedetection'];
+const TRIGGER_KEYWORDS = [
+  'face',
+  'human',
+  'vmd',
+  'regionentrance',
+  'regionexiting',
+  'linedetection',
+  'intelligent',
+];
 
-const lastEventTime = new Map<string, number>();
-
+const webhookCooldown = new Map<string, number>();
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
@@ -41,12 +61,17 @@ export interface WebhookResult {
   cameraId?: string;
   cameraIp?: string;
   recognition?: any;
+  snapshot_path?: string;
   timestamp?: string;
   message?: string;
 }
 
+function cleanIp(ip: string): string {
+  return ip.replace(/^::ffff:/i, '');
+}
+
 function getCooldownKey(ip: string, cameraId?: string): string {
-  return cameraId ? `${cameraId}` : ip;
+  return cameraId ? `cam:${cameraId}` : `ip:${ip}`;
 }
 
 function isDetectionTrigger(payload: string, contentType?: string): boolean {
@@ -69,25 +94,27 @@ function isDetectionTrigger(payload: string, contentType?: string): boolean {
 
 async function fetchSnapshotUniversal(camera: CameraConfig): Promise<Buffer | null> {
   const paths = SNAPSHOT_PATHS[camera.brand];
-  const auth = { username: camera.username, password: camera.password };
+  const auth =
+    camera.username && camera.password
+      ? { username: camera.username, password: camera.password }
+      : undefined;
 
-  for (const path of paths) {
+  for (const snapshotPath of paths) {
     try {
-      const url = `http://${camera.ip}${path}`;
+      const url = `http://${camera.ip}${snapshotPath}`;
       const response = await axios.get(url, {
         responseType: 'arraybuffer',
         auth,
         timeout: SNAPSHOT_TIMEOUT_MS,
-        maxRedirects: 0,
-      });
+      } as any);
 
-      const buffer = Buffer.from(response.data);
+      const buffer = Buffer.from(response.data as ArrayBuffer);
       if (buffer.length > 2 && buffer[0] === 0xff && buffer[1] === 0xd8) {
         return buffer;
       }
     } catch (error) {
-      const axiosErr = error as AxiosError;
-      // try next path on 404/401/timeout
+      const axiosErr = error as any;
+      // Пробуем следующий путь при 404/401/timeout
       continue;
     }
   }
@@ -95,25 +122,25 @@ async function fetchSnapshotUniversal(camera: CameraConfig): Promise<Buffer | nu
   return null;
 }
 
-async function sendToPythonService(cameraId: string, imageBuffer: Buffer) {
-  const FormDataCtor = (globalThis as any).FormData;
-  if (!FormDataCtor) {
-    throw new Error('FormData is not available in this environment');
+async function saveSnapshotToDisk(personName: string | undefined, buffer: Buffer): Promise<string> {
+  const now = new Date();
+  const dateStr = `${String(now.getDate()).padStart(2, '0')}${String(now.getMonth() + 1).padStart(2, '0')}${now.getFullYear()}`;
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+  const safeName = (personName || 'unknown').replace(/[^a-zA-Zа-яА-Я0-9]/g, '_').substring(0, 30);
+  const filename = `${dateStr}_${timeStr}_${safeName}.jpg`;
+
+  // Путь к snapshots будет определён в server.ts
+  const fs = await import('fs');
+  const path = await import('path');
+  const snapshotsDir = path.join(process.cwd(), 'public', 'snapshots');
+
+  if (!fs.existsSync(snapshotsDir)) {
+    fs.mkdirSync(snapshotsDir, { recursive: true });
   }
 
-  const form = new FormDataCtor();
-  form.append('image', imageBuffer, {
-    filename: 'snapshot.jpg',
-    contentType: 'image/jpeg',
-  });
-  form.append('camera_id', String(cameraId));
-
-  const response = await axios.post('http://localhost:8001/recognize', form, {
-    headers: (form as any).getHeaders ? (form as any).getHeaders() : {},
-    timeout: 5000,
-  });
-
-  return response.data;
+  const filepath = path.join(snapshotsDir, filename);
+  fs.writeFileSync(filepath, buffer);
+  return `snapshots/${filename}`;
 }
 
 export async function handleCameraWebhook(
@@ -124,8 +151,10 @@ export async function handleCameraWebhook(
 ): Promise<WebhookResult> {
   try {
     const now = Date.now();
-    const key = getCooldownKey(clientIp);
-    const lastTime = lastEventTime.get(key) || 0;
+    const ip = cleanIp(clientIp);
+    const key = getCooldownKey(ip);
+    const lastTime = webhookCooldown.get(key) || 0;
+
     if (now - lastTime < COOLDOWN_MS) {
       return { success: false, reason: 'cooldown' };
     }
@@ -134,26 +163,30 @@ export async function handleCameraWebhook(
       return { success: false, reason: 'not_a_trigger' };
     }
 
-    const camera = getCameraConfig(clientIp);
+    const camera = getCameraConfig(ip);
     if (!camera) {
       return { success: false, reason: 'unknown_camera' };
     }
 
-    lastEventTime.set(key, now);
+    webhookCooldown.set(key, now);
 
     const imageBuffer = await fetchSnapshotUniversal(camera);
     if (!imageBuffer) {
-      return { success: false, reason: 'snapshot_failed' };
+      return { success: false, reason: 'snapshot_failed', cameraId: camera.id, cameraIp: camera.ip };
     }
 
-    const recognition = await sendToPythonService(camera.id, imageBuffer);
+    const snapshot_path = await saveSnapshotToDisk(undefined, imageBuffer);
 
     return {
       success: true,
       cameraId: camera.id,
       cameraIp: camera.ip,
-      recognition,
+      snapshot_path,
       timestamp: new Date().toISOString(),
+      recognition: {
+        snapshot_path,
+        source: 'webhook_pull',
+      },
     };
   } catch (error) {
     const err = error as Error;

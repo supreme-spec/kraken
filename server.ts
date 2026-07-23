@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, exec, ChildProcessWithoutNullStreams } from "child_process";
 import { promisify } from "util";
-import { handleCameraWebhook, type CameraConfig } from "./server/cameraWebhookHandler.js";
+import { handleCameraWebhook, ALLOWED_CAMERA_IPS, type CameraConfig } from "./server/cameraWebhookHandler.js";
 
 const execAsync = promisify(exec);
 import sharp from "sharp";
@@ -119,6 +119,63 @@ function apiKeyAuth(req: any, res: any, next: any) {
   if (token === API_KEY || headerKey === API_KEY) return next();
   return res.status(401).json({ detail: "Unauthorized: требуется API_KEY" });
 }
+
+function getCameraConfig(ip: string): CameraConfig | null {
+  const cleanIp = ip.replace(/^::ffff:/i, "");
+  const cam = cameras.find((c) => {
+    const camIp = c.ip_address || new URL(c.source).hostname;
+    return camIp === cleanIp;
+  });
+
+  if (!cam) return null;
+
+  const brand =
+    cam.camera_type === "Hikvision"
+      ? "hikvision"
+      : cam.camera_type === "UNV"
+        ? "uniview"
+        : "uniview";
+  const parsedSource = cam.source ? new URL(cam.source) : null;
+
+  return {
+    id: String(cam.id),
+    ip: cam.ip_address || parsedSource?.hostname || cleanIp,
+    username: cam.username || "admin",
+    password: cam.password || "",
+    brand,
+  };
+}
+
+app.post(
+  ["/webhooks/camera", "/webhooks/camera/"],
+  express.text({ type: ["application/xml", "application/json", "text/plain"] }),
+  async (req, res) => {
+    try {
+      const clientIp = (req.ip || req.socket.remoteAddress || "").replace(/^::ffff:/i, "");
+
+      if (!ALLOWED_CAMERA_IPS.has(clientIp)) {
+        logWarn(`[Webhook] Отклонен запрос с неизвестного IP: ${clientIp}`);
+        return res.status(403).send("Forbidden");
+      }
+
+      const result = await handleCameraWebhook(req.body, req.headers["content-type"], clientIp, getCameraConfig);
+
+      if (!result.success) {
+        return res.status(200).json({ success: false, reason: result.reason });
+      }
+
+      if (!result.cameraId) {
+        return res.status(200).json({ success: false, reason: "camera_not_found" });
+      }
+
+      return res.status(200).json({ success: true, camera_id: result.cameraId, processed: true });
+    } catch (err) {
+      logError(err as Error, { context: "universal camera webhook" });
+      return res.status(200).json({ error: "Failed to process webhook" });
+    }
+  }
+);
+
 app.use("/api", apiKeyAuth);
 
 // ── ENSURE DIRECTORIES & ASSETS EXIST ──

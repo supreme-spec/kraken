@@ -22,6 +22,8 @@
   "dependencies": {
     "@prisma/client": "^5.22.0",
     "@tailwindcss/vite": "^4.1.14",
+    "@types/axios": "^0.9.36",
+    "@types/form-data": "^2.2.1",
     "@types/node-fetch": "^2.6.12",
     "@types/unzipper": "^0.10.11",
     "@vitejs/plugin-react": "^5.0.4",
