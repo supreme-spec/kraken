@@ -39,6 +39,7 @@ const TRIGGER_KEYWORDS = [
   'regionexiting',
   'linedetection',
   'intelligent',
+  'alarm',
 ];
 
 const webhookCooldown = new Map<string, number>();
@@ -129,7 +130,6 @@ async function saveSnapshotToDisk(personName: string | undefined, buffer: Buffer
   const safeName = (personName || 'unknown').replace(/[^a-zA-Zа-яА-Я0-9]/g, '_').substring(0, 30);
   const filename = `${dateStr}_${timeStr}_${safeName}.jpg`;
 
-  // Путь к snapshots будет определён в server.ts
   const fs = await import('fs');
   const path = await import('path');
   const snapshotsDir = path.join(process.cwd(), 'public', 'snapshots');
@@ -147,7 +147,8 @@ export async function handleCameraWebhook(
   rawBody: string,
   contentType: string | undefined,
   clientIp: string,
-  getCameraConfig: (ip: string) => CameraConfig | null
+  getCameraConfig: (ip: string) => CameraConfig | null,
+  onRecognized?: (result: any) => Promise<void>
 ): Promise<WebhookResult> {
   try {
     const now = Date.now();
@@ -176,6 +177,14 @@ export async function handleCameraWebhook(
     }
 
     const snapshot_path = await saveSnapshotToDisk(undefined, imageBuffer);
+
+    if (onRecognized) {
+      await onRecognized({
+        camera,
+        snapshot_path,
+        imageBuffer,
+      });
+    }
 
     return {
       success: true,
