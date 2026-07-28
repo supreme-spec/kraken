@@ -219,6 +219,7 @@ export default function App() {
   }, [])
 
   const renderPage = () => {
+    console.log('[App] renderPage', page)
     switch (page) {
       case 'live':
         return (

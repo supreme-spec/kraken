@@ -684,13 +684,32 @@ async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Pro
     }
   }
 
-  logError(lastError as Error, {
-    context: "Face Engine API request failed",
-    retries: FACE_REQUEST_RETRIES,
-    lastStatus,
-    circuitState,
-    failureCount: circuitFailureCount,
-  });
+  // Network errors (ECONNREFUSED, timeout, abort) — это WARN, не ERROR
+  // Они ожидаемы при старте или временной недоступности Python-сервера
+  const isNetworkError = lastError && (
+    (lastError as Error).message?.includes("fetch") ||
+    (lastError as Error).message?.includes("ECONNREFUSED") ||
+    (lastError as Error).message?.includes("ETIMEDOUT") ||
+    (lastError as Error).name === "AbortError"
+  );
+
+  if (isNetworkError) {
+    logWarn((lastError as Error).message, {
+      context: "Face Engine API request failed (network)",
+      retries: FACE_REQUEST_RETRIES,
+      lastStatus,
+      circuitState,
+      failureCount: circuitFailureCount,
+    });
+  } else {
+    logError(lastError as Error, {
+      context: "Face Engine API request failed",
+      retries: FACE_REQUEST_RETRIES,
+      lastStatus,
+      circuitState,
+      failureCount: circuitFailureCount,
+    });
+  }
   throw lastError;
 }
 
@@ -763,7 +782,17 @@ async function getEmbeddingFromServer(
       error: result.error,
     };
   } catch (e) {
-    logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    // Network errors (ECONNREFUSED, timeout) — это WARN, не ERROR
+    const isNetworkError = (e as Error).message?.includes("fetch") ||
+                          (e as Error).message?.includes("ECONNREFUSED") ||
+                          (e as Error).message?.includes("ETIMEDOUT") ||
+                          (e as Error).name === "AbortError";
+    
+    if (isNetworkError) {
+      logWarn((e as Error).message, { context: "Получение эмбеддинга с Python-сервера (network)" });
+    } else {
+      logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    }
     return { descriptor: null, quality: null, issues: [], passed: false, error: (e as Error).message };
   }
 }
@@ -815,6 +844,10 @@ async function detectFacesFromServer(
       if (response.status === 400) {
         logDebug(`Детекция: кадр пустой или невалиден (400), пропуск`);
         return [];
+      }
+      // 5xx — реальная ошибка сервера
+      if (response.status >= 500) {
+        logError(new Error(`Server responded with status: ${response.status}`), { context: "Детекция с Python-сервера" });
       }
       throw new Error(`Server responded with status: ${response.status}`);
     }

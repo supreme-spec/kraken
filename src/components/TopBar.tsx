@@ -22,6 +22,7 @@ export default function TopBar({
   releaseButton,
   onAvatarChange,
 }: TopBarProps) {
+  console.log('[TopBar] render', { cameras: cameras.length, selectedCameraId, alertCount, hasReleaseButton: !!releaseButton })
   const selected = cameras.find(c => c.id === selectedCameraId)
   const isOnline = selected?.status === 'online'
   const [avatarSrc, setAvatarSrc] = useState<string>(rusImg)

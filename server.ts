@@ -8,6 +8,13 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, exec, ChildProcessWithoutNullStreams } from "child_process";
 import { promisify } from "util";
+import dotenv from "dotenv";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+
+// Загрузка .env ДО всех остальных импортов
+dotenv.config();
 
 const execAsync = promisify(exec);
 import sharp from "sharp";
@@ -66,7 +73,32 @@ const API_KEY = process.env.API_KEY || "";
 const UNV_MAX_SNAPSHOT_WIDTH = parseInt(process.env.UNV_MAX_SNAPSHOT_WIDTH || "1280", 10);
 const UNV_MAX_SNAPSHOT_HEIGHT = parseInt(process.env.UNV_MAX_SNAPSHOT_HEIGHT || "720", 10);
 
-app.use(express.json());
+// ── SECURITY MIDDLEWARE ──────────────────────────────────────────────
+app.use(helmet());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+}));
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Too many requests, please try again later.",
+});
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Too many upload requests, please try again later.",
+});
+app.use("/api", apiLimiter);
+app.use("/webhooks", apiLimiter);
+
+app.use(express.json({ limit: "10mb" }));
 
 // Middleware для логирования запросов
 app.use((req, res, next) => {
@@ -145,7 +177,7 @@ app.use("/photos", apiKeyAuth, express.static(photosDir));
 app.use("/snapshots", apiKeyAuth, express.static(snapshotsDir));
 app.use("/recordings", apiKeyAuth, express.static(recordingsDir));
 
-// Multer upload setup
+// Multer upload setup with size limits
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, photosDir);
@@ -212,8 +244,8 @@ function normalizePositionName(pos: string): string {
   }).join(' ');
 }
 
-function getDuplicateKey(name: string): string {
-  return name ? name.replace(/\s+/g, '').toLowerCase() : '';
+function getDuplicateKey(name: string, position: string = ""): string {
+  return `${normalizePersonName(name)}|${normalizePositionName(position)}`.toLowerCase();
 }
 
 function fixFilesEncoding(files: Express.Multer.File[]): void {
@@ -940,15 +972,40 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
 app.put("/api/cameras/:id", async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    // Exclude fields that don't exist in Prisma schema
     const { created_at, ...updateData } = req.body;
+
+    // Проверяем, были ли изменены критические параметры подключения
+    const oldCam = cameras.find((c) => c.id === id);
+    const criticalChanged = oldCam && (
+      updateData.source !== undefined && updateData.source !== oldCam.source ||
+      updateData.username !== undefined && updateData.username !== oldCam.username ||
+      updateData.password !== undefined && updateData.password !== oldCam.password
+    );
+
     const updated = await prisma.camera.update({
       where: { id },
       data: updateData,
     });
+
     // Sync in-memory
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+
+    // Если изменился URL потока, логин или пароль — перезапускаем пайплайн
+    if (criticalChanged && updated.is_active) {
+      logInfo(`[API] Камера ${id}: критические параметры изменены, перезапуск пайплайна`);
+      destroyCameraResources(id);
+      const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
+      const rusSrc = path.join(assetsDir, "rus.jpg");
+      const logoSrc = path.join(assetsDir, "logo.jpg");
+      let fallbackFrame: string;
+      if (fs.existsSync(rusSrc)) fallbackFrame = fs.readFileSync(rusSrc).toString("base64");
+      else if (fs.existsSync(logoSrc)) fallbackFrame = fs.readFileSync(logoSrc).toString("base64");
+      else fallbackFrame = FALLBACK_JPEG;
+      const transport = cameraTransportFallback.get(id) || "tcp";
+      startCameraPipeline(updated, fallbackFrame, transport);
+    }
+
     res.json(sanitizeCamera(updated));
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "PUT" });
@@ -1075,57 +1132,19 @@ app.delete(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
       return res.status(404).json({ detail: "Camera not found" });
     }
 
-    const cleanup: string[] = [];
+    // Полная зачистка ресурсов: FFmpeg, записи, WebSocket, таймеры, файлы
+    destroyCameraResources(id);
 
-    // 1. Останавливаем FFmpeg, таймеры и ретраи
-    stopCameraPipeline(id);
-
-    // 2. Закрываем активные WebSocket-потоки камеры
-    const streams = cameraStreams.get(id);
-    if (streams) {
-      for (const ws of streams) {
-        try { ws.close(); } catch {}
-      }
-      cameraStreams.delete(id);
-      cleanup.push(`WebSocket-потоки закрыты`);
-    }
-
-    // 3. Удаляем файлы снапшотов событий этой камеры
-    const events = await prisma.event.findMany({
-      where: { camera_id: id },
-      select: { snapshot_path: true },
-    });
-    let deletedFiles = 0;
-    for (const ev of events) {
-      if (!ev.snapshot_path) continue;
-      const fullPath = path.join(publicDir, ev.snapshot_path);
-      if (fs.existsSync(fullPath)) {
-        try { fs.unlinkSync(fullPath); deletedFiles++; }
-        catch (err) { logWarn(`Не удалось удалить снапшот ${fullPath}: ${err}`); }
-      }
-    }
-    if (deletedFiles > 0) cleanup.push(`Снапшот-файлов удалено: ${deletedFiles}`);
-
-    // 4. Удаляем временные файлы камеры
-    const tempPrefix = `temp_snap_${id}_`;
-    const tempFile = path.join(snapshotsDir, `temp_snap_${id}.jpg`);
-    const tempFiles = (fs.existsSync(snapshotsDir) ? fs.readdirSync(snapshotsDir) : [])
-      .filter((f) => f === `temp_snap_${id}.jpg` || f.startsWith(tempPrefix));
-    for (const f of tempFiles) {
-      try { fs.unlinkSync(path.join(snapshotsDir, f)); } catch {}
-    }
-    if (tempFiles.length > 0) cleanup.push(`Временных файлов удалено: ${tempFiles.length}`);
-
-    // 5. Каскадное удаление из БД (Event и Recording удалятся via onDelete: Cascade)
+    // Каскадное удаление из БД (Event и Recording удалятся via onDelete: Cascade)
     await prisma.camera.delete({ where: { id } });
 
-    // 6. Удаление из оперативной памяти
+    // Удаление из оперативной памяти
     cameras = cameras.filter((c) => c.id !== id);
 
-    logInfo(`Камера ${cam.name} (${id}) полностью удалена`, { cleanup });
+    logInfo(`Камера ${cam.name} (${id}) удалена навсегда`);
     broadcastSecurity({ type: "CAMERA_DELETED", camera_id: id, camera_name: cam.name });
 
-    res.json({ success: true, message: "Камера удалена", cleanup });
+    res.json({ success: true, message: "Камера удалена навсегда" });
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "DELETE" });
     res.status(404).json({ detail: "Camera not found" });
@@ -1580,7 +1599,14 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
   }
 });
 
-const importJobs: Record<string, any> = {};
+const importJobs = new Map<string, {
+  status: 'pending' | 'processing' | 'done' | 'error';
+  progress: number;
+  total: number;
+  processed: number;
+  results: any[];
+  error?: string;
+}>();
 
 app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any(), (req, res) => {
   let files: Express.Multer.File[] = [];
@@ -1601,19 +1627,18 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
   }
 
   const category = (req.body.category || 'CLIENT').toUpperCase();
-  const jobId = `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const jobId = `import_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-  importJobs[jobId] = {
+  importJobs.set(jobId, {
     status: 'pending',
     progress: 0,
-    created: [],
-    failed: [],
-    skipped: []
-  };
+    total: files.length,
+    processed: 0,
+    results: []
+  });
 
-  // Process files asynchronously
-  setTimeout(async () => {
-    const job = importJobs[jobId];
+  setImmediate(async () => {
+    const job = importJobs.get(jobId);
     if (!job) return;
     job.status = 'processing';
 
@@ -1621,6 +1646,12 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
       where: { category },
       select: { id: true, name: true, category: true, position: true, photos: true }
     });
+
+    const personMap = new Map<string, any>();
+    for (const p of existingAll) {
+      const key = getDuplicateKey(p.name, p.position || "");
+      personMap.set(key, p);
+    }
 
     for (let index = 0; index < files.length; index++) {
       const f = files[index];
@@ -1634,8 +1665,8 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
         const position = rawPosition ? normalizePositionName(rawPosition.replace(/\_/g, ' ').trim()) : null;
         const photo_path = `photos/${f.filename}`;
         const fullPath = path.join(publicDir, photo_path);
-        const dupKey = getDuplicateKey(name);
-        const existingPerson = existingAll.find((p: any) => getDuplicateKey(p.name) === dupKey) || null;
+        const dupKey = getDuplicateKey(name, position || "");
+        const existingPerson = personMap.get(dupKey) || null;
 
         if (existingPerson) {
           const regResult = await enrollPhotoWithGate(existingPerson.id, name, category, photo_path, fullPath);
@@ -1649,7 +1680,7 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
           if (isPrimary) {
             await prisma.person.update({ where: { id: existingPerson.id }, data: { photo_path } });
           }
-          job.created.push({ name, position: existingPerson.position, embeddings: regResult.hasEmbedding ? 1 : 0, photos: 1, photos_without_embedding: regResult.hasEmbedding ? 0 : 1 });
+          job.results.push({ file: f.originalname, status: 'merged', person_id: existingPerson.id, name, position, photo_path });
         } else {
           const newPerson = await prisma.person.create({
             data: { name, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
@@ -1664,33 +1695,24 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
           });
           const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
           if (created) persons.unshift({ ...created });
-          existingAll.push(created);
-          job.created.push({ name, position, embeddings: regResult.hasEmbedding ? 1 : 0, photos: 1, photos_without_embedding: regResult.hasEmbedding ? 0 : 1 });
+          personMap.set(dupKey, created);
+          job.results.push({ file: f.originalname, status: 'created', person_id: newPerson.id, name, position, photo_path });
         }
       } catch (err: any) {
-        job.failed.push({ file: f.originalname, error: err.message || 'Ошибка обработки' });
+        job.results.push({ file: f.originalname, status: 'error', error: err.message || 'Ошибка обработки' });
       }
-      job.progress = index + 1;
+      job.processed = index + 1;
+      job.progress = Math.round((job.processed / job.total) * 100);
     }
 
-    const aggregated: Record<string, any> = {};
-    for (const c of job.created) {
-      const key = `${c.name}__${c.position ?? ''}`;
-      if (!aggregated[key]) aggregated[key] = { name: c.name, position: c.position ?? null, embeddings: 0, photos: 0, photos_without_embedding: 0 };
-      aggregated[key].embeddings += c.embeddings;
-      aggregated[key].photos += c.photos;
-      aggregated[key].photos_without_embedding += c.photos_without_embedding;
-    }
-    job.created = Object.values(aggregated);
     job.status = 'done';
-  }, 100);
+  });
 
-  res.json({ job_id: jobId });
+  res.json({ success: true, job_id: jobId, message: "Импорт запущен в фоновом режиме" });
 });
 
 app.get(["/api/persons/bulk_import/:job_id", "/api/persons/bulk_import/:job_id/"], (req, res) => {
-  const { job_id } = req.params;
-  const job = importJobs[job_id];
+  const job = importJobs.get(req.params.job_id);
   if (job) {
     res.json(job);
   } else {
@@ -3859,6 +3881,37 @@ const EOI = Buffer.from([0xFF, 0xD9]);
 // Fallback: камеры, на которых TCP уже падал с -138, след. попытка будет через UDP
 const cameraTransportFallback = new Map<number, "tcp" | "udp">();
 
+// ── Проверка доступности USB-устройства (Windows dshow) ──
+// Кэш результатов для избежания повторных проверок
+const usbDeviceCache = new Map<string, boolean>();
+
+async function isUsbDeviceAvailable(deviceId: string): Promise<boolean> {
+  // deviceId может быть "0", "/dev/video0", "USB Video Device" и т.д.
+  // На Windows dshow ищет по индексу или имени
+  try {
+    // Проверяем кэш
+    if (usbDeviceCache.has(deviceId)) {
+      return usbDeviceCache.get(deviceId)!;
+    }
+    
+    const ffmpegPath = getFfmpegPath();
+    // Используем быстрый список устройств dshow вместо реального захвата
+    const cmd = `"${ffmpegPath}" -y -f dshow -list_devices true -i dummy 2>&1`;
+    const { stdout } = await execAsync(cmd, { timeout: 2000 });
+    
+    // Проверяем наличие устройства в списке
+    const available = stdout.includes(`video=${deviceId}`) ||
+                      stdout.includes(`USB Video Device`) ||
+                      stdout.includes(`Video Device ${deviceId}`);
+    
+    usbDeviceCache.set(deviceId, available);
+    return available;
+  } catch {
+    usbDeviceCache.set(deviceId, false);
+    return false;
+  }
+}
+
 function getFallbackFrame(): string {
   const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
   const rusSrc = path.join(assetsDir, "rus.jpg");
@@ -3870,6 +3923,18 @@ function getFallbackFrame(): string {
 
 function startCameraPipeline(cam: any, fallbackFrame: string, transportOverride?: "tcp" | "udp") {
   if (!cam.source) return;
+
+  // Проверка доступности USB-устройства перед запуском FFmpeg
+  if (cam.source.startsWith("/dev/video") || cam.camera_type === "USB") {
+    const deviceId = cam.source.replace("/dev/video", "");
+    if (deviceId && /^\d+$/.test(deviceId)) {
+      const available = isUsbDeviceAvailable(deviceId);
+      if (!available) {
+        logWarn(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} недоступно, пропускаю запуск`);
+        return;
+      }
+    }
+  }
 
   const transport = transportOverride || cameraTransportFallback.get(cam.id) || "tcp";
   const args = [
@@ -4026,6 +4091,68 @@ function stopCameraPipeline(cameraId: number) {
   }
   cameraFfmpegRetries.delete(cameraId);
   cameraFrames.delete(cameraId);
+}
+
+function destroyCameraResources(cameraId: number) {
+  // 1. Убиваем FFmpeg-процесс
+  const proc = activeFfmpegProcesses.get(cameraId);
+  if (proc) {
+    try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    activeFfmpegProcesses.delete(cameraId);
+  }
+
+  // 2. Останавливаем запись видео (если активна)
+  const recSession = activeRecordings.get(cameraId);
+  if (recSession) {
+    try { recSession.proc.kill("SIGKILL"); } catch { /* ignore */ }
+    activeRecordings.delete(cameraId);
+  }
+
+  // 3. Останавливаем таймеры детекции
+  const detTimer = cameraDetectionTimers.get(cameraId);
+  if (detTimer) {
+    clearInterval(detTimer);
+    cameraDetectionTimers.delete(cameraId);
+  }
+
+  // 4. Отменяем отложенный перезапуск и сбрасываем backoff
+  const restartTimer = cameraRestartTimers.get(cameraId);
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    cameraRestartTimers.delete(cameraId);
+  }
+  cameraFfmpegRetries.delete(cameraId);
+
+  // 5. Закрываем все WebSocket-клиенты камеры
+  const streams = cameraStreams.get(cameraId);
+  if (streams) {
+    for (const ws of streams) {
+      try { ws.close(); } catch { /* ignore */ }
+    }
+    cameraStreams.delete(cameraId);
+  }
+
+  // 6. Удаляем кадр и данные детекции из памяти
+  cameraFrames.delete(cameraId);
+
+  // 7. Удаляем физические файлы записей и снапшотов камеры
+  try {
+    if (fs.existsSync(recordingsDir)) {
+      const recFiles = fs.readdirSync(recordingsDir).filter(f => f.startsWith(`cam${cameraId}_`));
+      for (const f of recFiles) {
+        try { fs.unlinkSync(path.join(recordingsDir, f)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (fs.existsSync(snapshotsDir)) {
+      const snapFiles = fs.readdirSync(snapshotsDir).filter(f => f.startsWith(`temp_snap_${cameraId}_`) || f === `temp_snap_${cameraId}.jpg`);
+      for (const f of snapFiles) {
+        try { fs.unlinkSync(path.join(snapshotsDir, f)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
 }
 
 // Upgrade handling for websockets
@@ -4239,11 +4366,38 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
 
     if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
 
-    // Сохраняем текущую БД как pre-restore backup
+    // 1. Полная зачистка всех ресурсов камер перед восстановлением
+    const cameraIds = cameras.map(c => c.id);
+    for (const camId of cameraIds) {
+      destroyCameraResources(camId);
+    }
+    cameras = [];
+    persons = [];
+    chronicleData = {};
+    recordingsData = {};
+    activeRecordings.clear();
+    cameraStreams.clear();
+    activeFfmpegProcesses.clear();
+    cameraDetectionTimers.clear();
+    cameraRestartTimers.clear();
+    cameraFfmpegRetries.clear();
+    cameraFrames.clear();
+    cameraTransportFallback.clear();
+    usbDeviceCache.clear();
+    lastEventAt.clear();
+    lastUnknownPersonAt.clear();
+    recentEventDedup.clear();
+
+    // 2. Сохраняем текущую БД как pre-restore backup
     const dbPath = path.join(process.cwd(), "prisma", "dev.db");
     if (fs.existsSync(dbPath)) {
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       fs.copyFileSync(dbPath, path.join(backupsDir, `pre_restore_${ts}.db`));
+    }
+
+    // 3. Удаляем старую БД, чтобы restore создал чистую
+    if (fs.existsSync(dbPath)) {
+      fs.unlinkSync(dbPath);
     }
 
     const zipPath = req.file.path;
@@ -4270,8 +4424,14 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
     // Cleanup temp file
     fs.unlinkSync(zipPath);
 
-    logInfo("Backup restored successfully");
-    res.json({ ok: true, message: "Резервная копия восстановлена. Перезагрузите приложение.", errors });
+    // 4. Перезагружаем камеры из восстановленной БД
+    const restoredCameras = await prisma.camera.findMany({ orderBy: { id: "asc" } });
+    cameras = restoredCameras.map((c: any) => ({ ...c, status: c.status || "offline" }));
+    const restoredPersons = await prisma.person.findMany();
+    persons = restoredPersons;
+
+    logInfo("Backup restored successfully — все ресурсы зачищены, камеры перезагружены");
+    res.json({ ok: true, message: "Резервная копия восстановлена. Камеры перезагружены.", errors });
   } catch (err: any) {
     logError(err as Error, { path: "/api/backup/restore" });
     res.json({ ok: false, message: err.message, errors: [err.message] });
@@ -4562,6 +4722,78 @@ async function seedDatabase() {
   logInfo(`Загружено: ${categories.length} категорий, ${persons.length} персон, ${cameras.length} камер`);
 }
 
+// ── Проверка и оптимизация камер при старте ──
+async function validateAndOptimizeCameras(): Promise<void> {
+  logInfo("Проверка доступности камер...");
+  
+  const usbDevicesChecked = new Map<string, boolean>();
+  
+  for (const cam of cameras) {
+    if (!cam.is_active) continue;
+    
+    const isUSB = cam.source?.startsWith("/dev/video") || cam.camera_type === "USB";
+    if (!isUSB) continue;
+    
+    // Извлекаем ID устройства из source (например, "/dev/video0" → "0")
+    const deviceId = cam.source?.replace("/dev/video", "") || "";
+    if (!deviceId || !/^\d+$/.test(deviceId)) continue;
+    
+    // Кэшируем результат проверки для одинаковых устройств
+    if (usbDevicesChecked.has(deviceId)) {
+      const available = usbDevicesChecked.get(deviceId)!;
+      if (!available) {
+        logWarn(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} недоступно, отключаю камеру`);
+        await prisma.camera.update({
+          where: { id: cam.id },
+          data: { is_active: false, status: "offline" }
+        });
+        cam.is_active = false;
+        cam.status = "offline";
+      }
+      continue;
+    }
+    
+    // Проверяем устройство с коротким таймаутом (1 сек)
+    try {
+      const ffmpegPath = getFfmpegPath();
+      const cmd = `"${ffmpegPath}" -y -f dshow -list_devices true -i dummy 2>&1`;
+      const { stdout } = await execAsync(cmd, { timeout: 3000 });
+      
+      // Проверяем, есть ли устройство в списке dshow
+      const deviceFound = stdout.includes(`video=${deviceId}`) || 
+                          stdout.includes(`video=${deviceId}`) ||
+                          stdout.includes(`Video Device ${deviceId}`) ||
+                          stdout.includes(`USB Video Device`);
+      
+      usbDevicesChecked.set(deviceId, deviceFound);
+      
+      if (!deviceFound) {
+        logWarn(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} не найдено в dshow, отключаю камеру`);
+        await prisma.camera.update({
+          where: { id: cam.id },
+          data: { is_active: false, status: "offline" }
+        });
+        cam.is_active = false;
+        cam.status = "offline";
+      } else {
+        logInfo(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} найдено`);
+      }
+    } catch {
+      logWarn(`[Camera ${cam.id}] Не удалось проверить USB-устройство /dev/video${deviceId}, отключаю`);
+      usbDevicesChecked.set(deviceId, false);
+      await prisma.camera.update({
+        where: { id: cam.id },
+        data: { is_active: false, status: "offline" }
+      });
+      cam.is_active = false;
+      cam.status = "offline";
+    }
+  }
+  
+  const activeUSB = cameras.filter(c => c.is_active && (c.source?.startsWith("/dev/video") || c.camera_type === "USB")).length;
+  logInfo(`Проверка камер завершена: ${activeUSB} USB-камер доступно`);
+}
+
 // Middleware для обработки ошибок
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   logError(err, { url: req.url, method: req.method });
@@ -4624,10 +4856,15 @@ async function start() {
   });
   process.on('uncaughtException', (err: Error) => {
     logError(err, { context: 'uncaughtException' });
+    console.error('❌ Uncaught exception:', err);
+    process.exit(1);
   });
 
   // Инициализация базы данных
   await seedDatabase();
+
+  // Проверка и оптимизация камер (отключение недоступных USB-устройств)
+  await validateAndOptimizeCameras();
 
   // Подгружаем существующие записи в in-memory архив (календарь «Видеозаписи»)
   try {
@@ -4636,6 +4873,29 @@ async function start() {
     if (existingRecs.length) logInfo(`Загружено в архив записей: ${existingRecs.length}`);
   } catch (e) {
     logError(e as Error, { context: "load recordings to chronicle" });
+  }
+
+  // Ожидание Python-сервера перед инициализацией Face Engine
+  logInfo("Ожидание Python Face Server...");
+  const faceServerUrl = process.env.FACE_SERVER_URL || "http://localhost:8001";
+  let pythonReady = false;
+  for (let i = 0; i < 30; i++) {
+    try {
+      const resp = await fetch(`${faceServerUrl}/health`, { signal: AbortSignal.timeout(2000) });
+      if (resp.ok) {
+        pythonReady = true;
+        logInfo(`Python Face Server доступен (${faceServerUrl})`);
+        break;
+      }
+    } catch {
+      // Сервер ещё не готов
+    }
+    await new Promise(r => setTimeout(r, 1000));
+    if (i % 5 === 4) logInfo(`Ожидание Python Face Server... (${Math.floor((i + 1) / 5)}s)`);
+  }
+  
+  if (!pythonReady) {
+    logWarn(`Python Face Server не доступен через ${faceServerUrl} после 30s — продолжу без него`);
   }
 
   // Инициализация AI движка при старте с загрузкой дескрипторов из БД
@@ -4685,90 +4945,108 @@ async function start() {
 
   server.listen(PORT, HOST, () => {
     logInfo(`Server running on http://${HOST}:${PORT}`);
+    // Синхронный лог для отладки
+    console.log(`[DEBUG] Server.listen callback executed, port ${PORT} should be open`);
+    console.log(`[DEBUG] About to enter post-start setup...`);
+  }).on('error', (err: any) => {
+    logError(err, { context: 'server listen error' });
+    console.error('[DEBUG] Server listen error:', err.message);
   });
 
-  // Camera health check
-  const cameraHealthStatus = new Map<number, boolean>();
-  const resolveCameraIp = (cam: any): string | null => cam.ip_address || (() => {
-    try {
-      const u = new URL(cam.source || "");
-      return u.hostname || null;
-    } catch {
-      return null;
-    }
-  })();
-
-  setInterval(async () => {
-    const activeCameras = cameras.filter(c => c.is_active);
-    for (const cam of activeCameras) {
-      const ipAddress = resolveCameraIp(cam);
-      if (!ipAddress) continue;
-
-      let isOnline = false;
+  console.log(`[DEBUG] Starting post-server setup...`);
+  try {
+    // Camera health check
+    const cameraHealthStatus = new Map<number, boolean>();
+    const resolveCameraIp = (cam: any): string | null => cam.ip_address || (() => {
       try {
-        const { stdout } = await execAsync(`ping -n 1 -w 2000 ${ipAddress}`);
-        isOnline = !stdout.includes('100% packet loss');
+        const u = new URL(cam.source || "");
+        return u.hostname || null;
       } catch {
-        isOnline = false;
+        return null;
       }
+    })();
 
-      const prev = cameraHealthStatus.get(cam.id);
-      if (prev !== isOnline) {
-        cameraHealthStatus.set(cam.id, isOnline);
-        try {
-          await prisma.camera.update({
-            where: { id: cam.id },
-            data: { status: isOnline ? 'online' : 'offline' }
-          });
-          const idx = cameras.findIndex(c => c.id === cam.id);
-          if (idx >= 0) cameras[idx].status = isOnline ? 'online' : 'offline';
-          logInfo(`Камера ${cam.name} (${ipAddress}) ${isOnline ? 'онлайн' : 'офлайн'}`);
-          broadcastSecurity({
-            type: 'CAMERA_STATUS',
-            camera_id: cam.id,
-            camera_name: cam.name,
-            status: isOnline ? 'online' : 'offline',
-            timestamp: new Date().toISOString()
-          });
-        } catch (err) {
-          logError(err as Error, { context: 'camera health check update', cameraId: cam.id });
-        }
-      }
-    }
-  }, 60000);
+    setInterval(async () => {
+      try {
+        const activeCameras = cameras.filter(c => c.is_active);
+        for (const cam of activeCameras) {
+          const ipAddress = resolveCameraIp(cam);
+          if (!ipAddress) continue;
 
-  // Auto-cleanup orphan photos (no embeddings) — every 24 hours
-  setInterval(async () => {
-    try {
-      const orphans = await prisma.personPhoto.findMany({
-        where: { has_embedding: false },
-        include: { person: { select: { id: true, name: true } } },
-      });
-      if (orphans.length === 0) return;
-
-      let deletedFiles = 0;
-      let deletedRecords = 0;
-
-      for (const photo of orphans) {
-        try {
-          const fullPath = path.join(photosDir, photo.photo_path);
-          if (fs.existsSync(fullPath)) {
-            fs.unlinkSync(fullPath);
-            deletedFiles++;
+          let isOnline = false;
+          try {
+            const { stdout } = await execAsync(`ping -n 1 -w 2000 ${ipAddress}`);
+            isOnline = !stdout.includes('100% packet loss');
+          } catch {
+            isOnline = false;
           }
-        } catch (e) {
-          logError(e as Error, { context: "auto-delete-orphan-photo-file", path: photo.photo_path });
+
+          const prev = cameraHealthStatus.get(cam.id);
+          if (prev !== isOnline) {
+            cameraHealthStatus.set(cam.id, isOnline);
+            try {
+              await prisma.camera.update({
+                where: { id: cam.id },
+                data: { status: isOnline ? 'online' : 'offline' }
+              });
+              const idx = cameras.findIndex(c => c.id === cam.id);
+              if (idx >= 0) cameras[idx].status = isOnline ? 'online' : 'offline';
+              logInfo(`Камера ${cam.name} (${ipAddress}) ${isOnline ? 'онлайн' : 'офлайн'}`);
+              broadcastSecurity({
+                type: 'CAMERA_STATUS',
+                camera_id: cam.id,
+                camera_name: cam.name,
+                status: isOnline ? 'online' : 'offline',
+                timestamp: new Date().toISOString()
+              });
+            } catch (err) {
+              logError(err as Error, { context: 'camera health check update', cameraId: cam.id });
+            }
+          }
+        }
+      } catch (err) {
+        logError(err as Error, { context: 'camera health check interval' });
+      }
+    }, 60000);
+
+    // Auto-cleanup orphan photos (no embeddings) — every 24 hours
+    setInterval(async () => {
+      try {
+        const orphans = await prisma.personPhoto.findMany({
+          where: { has_embedding: false },
+          include: { person: { select: { id: true, name: true } } },
+        });
+        if (orphans.length === 0) return;
+
+        let deletedFiles = 0;
+        let deletedRecords = 0;
+
+        for (const photo of orphans) {
+          try {
+            const fullPath = path.join(photosDir, photo.photo_path);
+            if (fs.existsSync(fullPath)) {
+              fs.unlinkSync(fullPath);
+              deletedFiles++;
+            }
+          } catch (e) {
+            logError(e as Error, { context: "auto-delete-orphan-photo-file", path: photo.photo_path });
+          }
+
+          await prisma.personPhoto.delete({ where: { id: photo.id } });
+          deletedRecords++;
         }
 
-        await prisma.personPhoto.delete({ where: { id: photo.id } });
-        deletedRecords++;
+        logInfo(`[AutoCleanup] Удалено фото без эмбеддингов: ${deletedRecords} (файлов: ${deletedFiles})`);
+      } catch (e) {
+        logError(e as Error, { context: "auto-cleanup-orphan-photos" });
       }
-
-      logInfo(`[AutoCleanup] Удалено фото без эмбеддингов: ${deletedRecords} (файлов: ${deletedFiles})`);
-    } catch (e) {
-      logError(e as Error, { context: "auto-cleanup-orphan-photos" });
-    }
-  }, 24 * 60 * 60 * 1000);
+    }, 24 * 60 * 60 * 1000);
+  } catch (err) {
+    logError(err as Error, { context: 'post-start setup' });
+  }
 }
 
-start();
+start().catch((err) => {
+  console.error('❌ FATAL: start() failed:', err);
+  process.exit(1);
+});

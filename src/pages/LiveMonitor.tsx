@@ -174,6 +174,7 @@ export default function LiveMonitor({
   cameras, selectedCameraId, onSelectCamera,
   recentEvents, onLatestFace, onNavigateEvents, onNavigatePeople,
 }: Props) {
+  console.log('[LiveMonitor] render', { cameras: cameras.length, selectedCameraId, recentEvents: recentEvents.length, layout })
   const containerRef = useRef<HTMLDivElement>(null)
   const [containerSize, setContainerSize] = useState({ w: 1200, h: 700 })
   const [layout, setLayout] = useState<Layout>(() => defaultLayout(1200, 700))
@@ -196,6 +197,7 @@ export default function LiveMonitor({
     message: string;
   } | null>(null)
   const selectedCamera = cameras.find(c => c.id === selectedCameraId) ?? null
+  console.log('[LiveMonitor] selectedCamera', selectedCamera)
 
   // Templates state
   const [templates, setTemplates] = useState<LayoutTemplate[]>(() => loadTemplates())
@@ -506,6 +508,8 @@ export default function LiveMonitor({
     people: 'База людей', events: 'Последние события',
     guest: 'Последний гость',
   }
+
+  console.log('[LiveMonitor] about to render JSX', { layout })
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
