@@ -3120,13 +3120,39 @@ const lastEventAt = new Map<string, number>();
 // cameraId -> последнее время создания персоны из неизвестного (защита от дублей)
 const lastUnknownPersonAt = new Map<string, number>();
 
-/** Сохраняет снимок на диск только если ENABLE_AUTO_CHRONICLE=true. При false — возвращает fake-path, события в БД сохраняются. */
-function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: string): string {
+/**
+ * Сохраняет снимок на диск.
+ * @param isManual — ручное подтверждение оператора (сохраняется всегда)
+ * @returns путь к файлу или null если сохранение отключено
+ */
+function saveSnapshotFromFrame(
+  frameBase64: string,
+  cameraId: number,
+  label?: string,
+  isManual: boolean = false,
+): string | null {
   try {
-    // Отключаем сохранение кадров на диск для оптимизации I/O и CPU
-    if (process.env.ENABLE_AUTO_CHRONICLE !== "true") {
-      return "snapshots/chronicle_disabled.jpg";
+    // 1. Ручное подтверждение оператора — сохраняем ВСЕГДА
+    if (isManual) {
+      const now = new Date();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const dateStr = `${pad(now.getDate())}${pad(now.getMonth() + 1)}${now.getFullYear()}`;
+      const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      const safeLabel = label ? label.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 30) : "";
+      const name = safeLabel
+        ? `cam${cameraId}_${dateStr}_${timeStr}_${safeLabel}_confirm.jpg`
+        : `cam${cameraId}_${dateStr}_${timeStr}_confirm.jpg`;
+      const target = path.join(snapshotsDir, name);
+      fs.writeFileSync(target, Buffer.from(frameBase64, "base64"));
+      return `snapshots/${name}`;
     }
+
+    // 2. Автоматическая хроника — подчиняется ENABLE_AUTO_CHRONICLE
+    if (process.env.ENABLE_AUTO_CHRONICLE !== "true") {
+      return null; // Ничего не сохраняем, экономим I/O и CPU
+    }
+
+    // 3. Автосохранение включено
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const dateStr = `${pad(now.getDate())}${pad(now.getMonth() + 1)}${now.getFullYear()}`;
@@ -3140,7 +3166,7 @@ function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: st
     return `snapshots/${name}`;
   } catch (e) {
     logError(e as Error, { context: "saveSnapshotFromFrame" });
-    return "snapshots/ev1.jpg";
+    return null;
   }
 }
 
@@ -3206,7 +3232,7 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
 
   const confidence = match.similarity;
   const meetsVerification = confidence * 100 >= verification_threshold_pct;
-  const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, match.personName);
+  const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, match.personName, false);
   recordVisitor(cam.id, match.personId, match.personName, snapshot_path);
 
   try {
@@ -3371,7 +3397,7 @@ async function createUnknownPersonFromFace(
 }
 
 async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
-  const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id);
+  const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, undefined, false);
 
   let personId: number | null = null;
   let personName: string | null = null;
@@ -3509,17 +3535,13 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
   lastConfirmationAt.set(key, Date.now());
 
   try {
-    // Отключаем сохранение кадров на диск для оптимизации I/O и CPU
+    // Ручное подтверждение оператора — сохраняем ВСЕГДА (независимо от ENABLE_AUTO_CHRONICLE)
     let temp_photo_path: string | null = null;
-    if (process.env.ENABLE_AUTO_CHRONICLE === "true") {
-      if (!fs.existsSync(confirmationsDir)) fs.mkdirSync(confirmationsDir, { recursive: true });
-      const filename = `confirm_${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
-      const tempFull = path.join(confirmationsDir, filename);
-      await fs.promises.writeFile(tempFull, Buffer.from(frameBase64, "base64"));
-      temp_photo_path = `confirmations/${filename}`;
-    } else {
-      logDebug(`[Chronicle] Auto-save skipped (ENABLE_AUTO_CHRONICLE !== true) for camera ${cam.id}, person ${personId}`);
-    }
+    if (!fs.existsSync(confirmationsDir)) fs.mkdirSync(confirmationsDir, { recursive: true });
+    const filename = `confirm_${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
+    const tempFull = path.join(confirmationsDir, filename);
+    await fs.promises.writeFile(tempFull, Buffer.from(frameBase64, "base64"));
+    temp_photo_path = `confirmations/${filename}`;
 
     const candidate = persons.find((p: any) => p.id === personId);
     const existing_photo_path = candidate?.photo_path || null;
@@ -3528,7 +3550,7 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       data: {
         person_id: personId,
         confidence: match.similarity,
-        temp_photo_path: temp_photo_path,
+        temp_photo_path,
         existing_photo_path,
         person_name: match.personName,
         category: match.category,
@@ -3536,8 +3558,8 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       },
     });
 
-    // Событие в ленту (оператор видит в «Событиях»)
-    const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, match.personName);
+    // Событие в ленту (оператор видит в «Событиях») — ручное, сохраняем кадр
+    const snapshot_path = saveSnapshotFromFrame(frameBase64, cam.id, match.personName, true);
     recordVisitor(cam.id, personId, match.personName, snapshot_path);
     await persistAndBroadcastEvent({
       cameraId: cam.id,
