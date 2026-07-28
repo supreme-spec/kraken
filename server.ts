@@ -994,6 +994,7 @@ app.put("/api/cameras/:id", async (req, res) => {
     // Если изменился URL потока, логин или пароль — перезапускаем пайплайн
     if (criticalChanged && updated.is_active) {
       logInfo(`[API] Камера ${id}: критические параметры изменены, перезапуск пайплайна`);
+      const transport = cameraTransportFallback.get(id) || "tcp";
       destroyCameraResources(id);
       const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
       const rusSrc = path.join(assetsDir, "rus.jpg");
@@ -1002,8 +1003,13 @@ app.put("/api/cameras/:id", async (req, res) => {
       if (fs.existsSync(rusSrc)) fallbackFrame = fs.readFileSync(rusSrc).toString("base64");
       else if (fs.existsSync(logoSrc)) fallbackFrame = fs.readFileSync(logoSrc).toString("base64");
       else fallbackFrame = FALLBACK_JPEG;
-      const transport = cameraTransportFallback.get(id) || "tcp";
       startCameraPipeline(updated, fallbackFrame, transport);
+    }
+
+    // Если камеру деактивировали — освобождаем все ресурсы
+    if (!updated.is_active && oldCam && oldCam.is_active) {
+      logInfo(`[API] Камера ${id}: деактивация, освобождаем ресурсы`);
+      destroyCameraResources(id);
     }
 
     res.json(sanitizeCamera(updated));
@@ -4123,7 +4129,10 @@ function destroyCameraResources(cameraId: number) {
   }
   cameraFfmpegRetries.delete(cameraId);
 
-  // 5. Закрываем все WebSocket-клиенты камеры
+  // 5. Сбрасываем fallback-транспорт
+  cameraTransportFallback.delete(cameraId);
+
+  // 6. Закрываем все WebSocket-клиенты камеры
   const streams = cameraStreams.get(cameraId);
   if (streams) {
     for (const ws of streams) {
