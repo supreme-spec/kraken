@@ -3120,8 +3120,13 @@ const lastEventAt = new Map<string, number>();
 // cameraId -> последнее время создания персоны из неизвестного (защита от дублей)
 const lastUnknownPersonAt = new Map<string, number>();
 
+/** Сохраняет снимок на диск только если ENABLE_AUTO_CHRONICLE=true. При false — возвращает fake-path, события в БД сохраняются. */
 function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: string): string {
   try {
+    // Отключаем сохранение кадров на диск для оптимизации I/O и CPU
+    if (process.env.ENABLE_AUTO_CHRONICLE !== "true") {
+      return "snapshots/chronicle_disabled.jpg";
+    }
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const dateStr = `${pad(now.getDate())}${pad(now.getMonth() + 1)}${now.getFullYear()}`;
@@ -3504,11 +3509,17 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
   lastConfirmationAt.set(key, Date.now());
 
   try {
-    if (!fs.existsSync(confirmationsDir)) fs.mkdirSync(confirmationsDir, { recursive: true });
-    const filename = `confirm_${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
-    const tempFull = path.join(confirmationsDir, filename);
-    await fs.promises.writeFile(tempFull, Buffer.from(frameBase64, "base64"));
-    const temp_photo_path = `confirmations/${filename}`;
+    // Отключаем сохранение кадров на диск для оптимизации I/O и CPU
+    let temp_photo_path: string | null = null;
+    if (process.env.ENABLE_AUTO_CHRONICLE === "true") {
+      if (!fs.existsSync(confirmationsDir)) fs.mkdirSync(confirmationsDir, { recursive: true });
+      const filename = `confirm_${Date.now()}_${Math.floor(Math.random() * 1000)}.jpg`;
+      const tempFull = path.join(confirmationsDir, filename);
+      await fs.promises.writeFile(tempFull, Buffer.from(frameBase64, "base64"));
+      temp_photo_path = `confirmations/${filename}`;
+    } else {
+      logDebug(`[Chronicle] Auto-save skipped (ENABLE_AUTO_CHRONICLE !== true) for camera ${cam.id}, person ${personId}`);
+    }
 
     const candidate = persons.find((p: any) => p.id === personId);
     const existing_photo_path = candidate?.photo_path || null;
@@ -3517,7 +3528,7 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       data: {
         person_id: personId,
         confidence: match.similarity,
-        temp_photo_path,
+        temp_photo_path: temp_photo_path,
         existing_photo_path,
         person_name: match.personName,
         category: match.category,
@@ -3551,7 +3562,7 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       person_name: match.personName,
       category: match.category,
       confidence: match.similarity,
-      temp_photo: `/${temp_photo_path}`,
+      temp_photo: temp_photo_path ? `/${temp_photo_path}` : null,
       existing_photo: existing_photo_path ? `/${existing_photo_path}` : null,
     });
 
