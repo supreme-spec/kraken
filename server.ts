@@ -2952,6 +2952,14 @@ function buildFfmpegInputArgs(cam: any, transport: "tcp" | "udp" = "tcp"): strin
 
   let source = (cam.source || "").trim();
 
+  // Добавляем rtsp:// если URL без протокола (например: 192.168.1.1:554/... или user:pass@192.168.1.1:554/...)
+  if (source && !/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//i.test(source)) {
+    // Проверяем, выглядит ли строка как RTSP-адрес (содержит :554 или /Streaming)
+    if (source.includes(":554") || source.includes("/Streaming") || source.includes("/stream")) {
+      source = "rtsp://" + source;
+    }
+  }
+
   if (/^rtsp:\/\//i.test(source)) {
     try {
       const u = new URL(source);
