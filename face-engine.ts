@@ -1694,13 +1694,14 @@ export async function detectFacesWithDistance(
     formData.append("image", blob as any, "image.jpg");
     formData.append("with_descriptors", "true");
 
-    // Отправляем параметры камеры для distance-расчётов
+    // Отправляем параметры камеры для distance-расчётов (всегда, для graceful degradation)
     if (cam.distance_calib_mode) formData.append("distance_calib_mode", cam.distance_calib_mode);
     if (cam.roi_zones) formData.append("roi_polygon", cam.roi_zones);
-    if (cam.distance_min_m) formData.append("distance_min_m", String(cam.distance_min_m));
-    if (cam.distance_max_m) formData.append("distance_max_m", String(cam.distance_max_m));
-    if (cam.distance_ignore_m) formData.append("distance_ignore_m", String(cam.distance_ignore_m));
-    if (cam.focal_length_px) formData.append("focal_length_px", String(cam.focal_length_px));
+    formData.append("distance_min_m", String(cam.distance_min_m ?? 2.0));
+    formData.append("distance_max_m", String(cam.distance_max_m ?? 4.0));
+    formData.append("distance_ignore_m", String(cam.distance_ignore_m ?? 1.5));
+    // focal_length_px — всегда, даже если 0/не задан: pinhole fallback = graceful degradation
+    formData.append("focal_length_px", String(cam.focal_length_px ?? 1400));
 
     const response = await apiFetchWithKey(`${FACE_SERVER_URL}/detect-with-distance`, {
       method: "POST",
