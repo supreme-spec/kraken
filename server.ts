@@ -3024,22 +3024,24 @@ function recordToChronicle(rec: any) {
 }
 
 /** Добавляет посетителя в in-memory «Хронику» (вкладка Архив фото). */
-function recordVisitor(cameraId: number, person_id: number | null, person_name: string, snapshot_path: string) {
+function recordVisitor(cameraId: number, person_id: number | null, person_name: string, snapshot_path: string | null) {
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
-  const filename = path.basename(snapshot_path);
+  const filename = snapshot_path ? path.basename(snapshot_path) : "no_image.jpg";
   let size_kb = 0;
   try {
-    const stat = fs.statSync(path.join(publicDir, snapshot_path));
-    size_kb = Math.round(stat.size / 1024);
+    if (snapshot_path) {
+      const stat = fs.statSync(path.join(publicDir, snapshot_path));
+      size_kb = Math.round(stat.size / 1024);
+    }
   } catch { /* ignore */ }
   const visitor: Visitor = {
     filename,
     person_id,
     person_name,
     time,
-    photo_url: snapshot_path,
+    photo_url: snapshot_path ?? "no_image.jpg",
     size_kb,
   };
   if (!chronicleData[cameraId]) chronicleData[cameraId] = {};
@@ -3176,7 +3178,7 @@ async function persistAndBroadcastEvent(e: {
   personId?: number;
   event_type: string;
   confidence: number;
-  snapshot_path: string;
+  snapshot_path: string | null;
   person_name?: string;
   person_category?: string;
   person_photo_path?: string;
@@ -3192,7 +3194,7 @@ async function persistAndBroadcastEvent(e: {
         person_id: e.personId,
         event_type: e.event_type,
         confidence: e.confidence,
-        snapshot_path: e.snapshot_path,
+        snapshot_path: e.snapshot_path ?? "",
         person_name: e.person_name,
         person_category: e.person_category,
         person_photo_path: e.person_photo_path,
@@ -3208,7 +3210,7 @@ async function persistAndBroadcastEvent(e: {
       person_name: e.person_name || "Неизвестный",
       camera_id: e.cameraId,
       confidence: e.confidence,
-      snapshot_path: e.snapshot_path,
+      snapshot_path: e.snapshot_path ?? "",
       timestamp: new Date().toISOString(),
     });
     broadcastSecurity({ type: "EVENT" });

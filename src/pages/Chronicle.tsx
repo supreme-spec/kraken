@@ -37,7 +37,7 @@ interface Visitor {
   person_id: number | null
   person_name: string
   time: string
-  photo_url: string
+  photo_url: string | null
   size_kb: number
 }
 
@@ -60,9 +60,9 @@ interface Stats {
 // ── Компонент ─────────────────────────────────────────────────────────────────
 
 // ── Вспомогательный компонент для изображений с фоллбеком ─────────────────────
-function ChronicleImage({ src, alt }: { src: string; alt: string }) {
+function ChronicleImage({ src, alt }: { src: string | null; alt: string }) {
   const [error, setError] = useState(false)
-  if (error) {
+  if (error || !src) {
     return (
       <div className="w-full h-full flex items-center justify-center text-3xl text-kraken-disabled bg-kraken-hover select-none">
         👤
@@ -291,10 +291,15 @@ export default function Chronicle() {
   // Скачать все фото дня как ZIP (через браузер — просто открываем каждое)
   const downloadDay = () => {
     if (!dayData) return
-    dayData.visitors.forEach((v, i) => {
+    const withPhotos = dayData.visitors.filter(v => v.photo_url)
+    if (withPhotos.length === 0) {
+      alert('Нет фото для скачивания (авто-хроника отключена)')
+      return
+    }
+    withPhotos.forEach((v, i) => {
       setTimeout(() => {
         const a = document.createElement('a')
-        a.href = v.photo_url
+        a.href = v.photo_url!
         a.download = v.filename
         a.click()
       }, i * 200)
@@ -548,17 +553,25 @@ export default function Chronicle() {
       {lightbox && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80" onClick={() => setLightbox(null)}>
           <div className="relative max-w-xl max-h-[90vh] mx-4 animate-fade-in" onClick={e => e.stopPropagation()}>
-            <img src={lightbox.photo_url} alt={lightbox.person_name}
-              className="max-w-full max-h-[85vh] rounded-xl shadow-2xl" />
+            {lightbox.photo_url ? (
+              <img src={lightbox.photo_url} alt={lightbox.person_name}
+                className="max-w-full max-h-[85vh] rounded-xl shadow-2xl" />
+            ) : (
+              <div className="w-full h-[50vh] flex items-center justify-center text-6xl bg-kraken-hover rounded-xl">
+                👤
+              </div>
+            )}
             <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
               <div className="text-white text-sm font-medium bg-black/50 px-3 py-1.5 rounded-lg">
-                {lightbox.person_name} · {lightbox.time} · {lightbox.size_kb} KB
+                {lightbox.person_name} · {lightbox.time} {lightbox.size_kb > 0 && `· ${lightbox.size_kb} KB`}
               </div>
               <div className="flex gap-2">
-                <a href={lightbox.photo_url} download={lightbox.filename}
-                  className="p-2 rounded-lg bg-black/50 text-white hover:bg-black/70 transition-colors" title="Скачать">
-                  <Download size={16} />
-                </a>
+                {lightbox.photo_url && (
+                  <a href={lightbox.photo_url} download={lightbox.filename}
+                    className="p-2 rounded-lg bg-black/50 text-white hover:bg-black/70 transition-colors" title="Скачать">
+                    <Download size={16} />
+                  </a>
+                )}
                 <button onClick={() => setLightbox(null)}
                   className="p-2 rounded-lg bg-black/50 text-white hover:bg-kraken-red transition-colors" title="Закрыть">
                   <X size={16} />
