@@ -4058,13 +4058,75 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
   let detectionInProgress = false;
   // v2: Set обработанных bbox-ключей — защита от повторного инференса одного и того же лица
   const processedKeys = new Set<string>();
-  // v2: lightweight IoU-tracking — история позиций для определения is_stopped / dwell
-  interface TrackEntry { bbox: [number, number, number, number]; firstSeen: number; }
-  const trackHistory = new Map<string, TrackEntry>();
-  const STABLE_THRESHOLD_MS = 3000;  // bbox стабилен ≥3с → считается остановленным
-  const DWELL_THRESHOLD_SEC = cam.dwell_time_sec ?? 15; // порог dwell из настроек камеры
-  // fallback-ключ: track_id (если трекер проставил) || bbox-центр
+
+  // ── v2: standing-time IoU-tracker (заменяет дребезжащий bbox-key) ──
+  interface Track {
+    id: number;
+    lastBbox: [number, number, number, number];
+    lastCentroid: [number, number];
+    lastMoved: number;   // время последнего ЗНАЧИМОГО смещения
+    lastSeen: number;    // для чистки мёртвых треков
+  }
+  const tracks: Track[] = [];
+  let nextTrackId = 1;
+  const MOVE_EPSILON_PX = 30;   // смещение центра МЕНЬШЕ = покачивание, НЕ сбрасывает стояние
+  const STOP_SMOOTH_MS  = 2000; // «неподвижен» ≥2с → is_stopped (сглаживание дёрганий)
+  const MAX_AGE_MS      = 3000; // трек без детекции 3с → удаляем (защита от утечки)
+  const DWELL_THRESHOLD_SEC = cam.dwell_time_sec ?? 15;
+
+  function centroidOf(b: [number, number, number, number]): [number, number] {
+    return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  }
+  function computeIoU(a: [number, number, number, number], b: [number, number, number, number]): number {
+    const iw = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+    const ih = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+    const inter = iw * ih;
+    const areaA = (a[2] - a[0]) * (a[3] - a[1]);
+    const areaB = (b[2] - b[0]) * (b[3] - b[1]);
+    const union = areaA + areaB - inter;
+    return union > 0 ? inter / union : 0;
+  }
+  // fallback-ключ: track_id (стабильный) || bbox-центр
   const keyOf = (f: any) => f.track_id != null ? String(f.track_id) : `b${Math.round((f.bbox[0] + f.bbox[2]) / 20)}_${Math.round((f.bbox[1] + f.bbox[3]) / 20)}`;
+
+  function updateTracks(faces: any[], now: number) {
+    // 1) greedy IoU-matching: детекция ↔ трек (стабильный track_id, не зависит от кванта)
+    const pairs: { di: number; ti: number; iou: number }[] = [];
+    faces.forEach((f, di) => tracks.forEach((t, ti) => {
+      pairs.push({ di, ti, iou: computeIoU(f.bbox, t.lastBbox) });
+    }));
+    pairs.sort((a, b) => b.iou - a.iou);
+    const usedT = new Set<number>(), usedD = new Set<number>();
+    const detTrack = new Map<number, Track>();
+    for (const p of pairs) {
+      if (p.iou < 0.3) break;
+      if (usedD.has(p.di) || usedT.has(p.ti)) continue;
+      detTrack.set(p.di, tracks[p.ti]);
+      usedD.add(p.di); usedT.add(p.ti);
+    }
+    // 2) обновляем matched, создаём новые для unmatched
+    faces.forEach((f, di) => {
+      const c = centroidOf(f.bbox);
+      let t = detTrack.get(di);
+      if (!t) {
+        t = { id: nextTrackId++, lastBbox: f.bbox, lastCentroid: c, lastMoved: now, lastSeen: now };
+        tracks.push(t);
+      } else {
+        const moved = Math.hypot(c[0] - t.lastCentroid[0], c[1] - t.lastCentroid[1]) > MOVE_EPSILON_PX;
+        if (moved) t.lastMoved = now;        // значимое смещение → сброс «стояния»
+        t.lastBbox = f.bbox; t.lastCentroid = c; t.lastSeen = now;
+      }
+      f.track_id = t.id;
+      // КЛЮЧЕВОЕ: standing-time = время с последнего движения, а не с первого появления
+      const standingMs = now - t.lastMoved;
+      f.is_stopped = standingMs >= STOP_SMOOTH_MS;
+      f.dwell_time_sec = standingMs / 1000;
+    });
+    // 3) чистка мёртвых треков (закрытие утечки)
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      if (now - tracks[i].lastSeen > MAX_AGE_MS) tracks.splice(i, 1);
+    }
+  }
 
   const timer = setInterval(async () => {
     if (!activeFfmpegProcesses.has(cam.id)) return;
@@ -4078,34 +4140,11 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
       const buf = Buffer.from(frameBase64, "base64");
       const faces = await detectFacesWithDistance(buf, cam);
 
-      // v2: lightweight tracking — обновляем историю bbox
-      const now = Date.now();
-      for (const f of faces as any[]) {
-        const k = keyOf(f);
-        const prev = trackHistory.get(k);
-        if (!prev) {
-          trackHistory.set(k, { bbox: f.bbox, firstSeen: now });
-        } else {
-          // Вычисляем IoU между предыдущим и текущим bbox
-          const [x1, y1, x2, y2] = prev.bbox;
-          const [nx1, ny1, nx2, ny2] = f.bbox;
-          const iw = Math.max(0, Math.min(x2, nx2) - Math.max(x1, nx1));
-          const ih = Math.max(0, Math.min(y2, ny2) - Math.max(y1, ny1));
-          const inter = iw * ih;
-          const areaA = (x2 - x1) * (y2 - y1);
-          const areaB = (nx2 - nx1) * (ny2 - ny1);
-          const iou = areaA + areaB > 0 ? inter / (areaA + areaB - inter) : 0;
-          // bbox стабилен (IoU > 0.8) и человек стоит ≥3с → is_stopped
-          f.is_stopped = iou > 0.8;
-          f.dwell_time_sec = (now - prev.firstSeen) / 1000;
-          // Обновляем историю
-          trackHistory.set(k, { bbox: f.bbox, firstSeen: iou > 0.8 ? prev.firstSeen : now });
-        }
-      }
+      // v2: standing-time IoU-tracker — вместо дребезжащего bbox-key
+      updateTracks(faces, Date.now());
 
-      // v2: чистим историю от лиц, ушедших из кадра
+      // v2: чистим processedKeys от лиц, ушедших из кадра
       const liveKeys = new Set((faces as any[]).map(f => keyOf(f)));
-      for (const k of trackHistory.keys()) { if (!liveKeys.has(k)) trackHistory.delete(k); }
       for (const k of processedKeys) { if (!liveKeys.has(k)) processedKeys.delete(k); }
 
       // v2: proxy-метрики со ВСЕХ лиц — fire-and-forget (сырьё для AI Quality)
