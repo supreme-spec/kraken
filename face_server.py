@@ -28,6 +28,12 @@ if "ORT_NUM_THREADS" not in os.environ:
 
 import cv2
 import numpy as np
+
+# ── v2: distance estimation helpers ──
+try:
+    from distance import estimate_depth_m, bbox_in_roi_polygon
+except ImportError:
+    from face_server.distance import estimate_depth_m, bbox_in_roi_polygon
 import faiss
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
@@ -744,6 +750,112 @@ async def detect_faces(
         raise
     except Exception as e:
         logger.error(f"Detection error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── v2: детекция с distance-расчётом ──
+@app.post("/detect-with-distance", dependencies=[Depends(verify_api_key)])
+async def detect_with_distance(
+    image: UploadFile = File(...),
+    max_faces: Optional[int] = 20,
+    min_confidence: Optional[float] = None,
+    with_descriptors: Optional[bool] = False,
+    distance_calib_mode: Optional[str] = None,
+    roi_polygon: Optional[str] = None,
+    distance_min_m: Optional[float] = None,
+    distance_max_m: Optional[float] = None,
+    distance_ignore_m: Optional[float] = None,
+    focal_length_px: Optional[float] = None,
+):
+    """Detects faces + estimates distance using the ladder calib method."""
+    try:
+        image_bytes = await image.read()
+        img = load_image_from_bytes(image_bytes)
+
+        if not is_initialized or face_app is None:
+            return {"faces": []}
+
+        if img is None or img.size == 0:
+            raise HTTPException(status_code=400, detail="Empty or invalid image")
+
+        height, width = img.shape[:2]
+
+        threshold = min_confidence if min_confidence is not None else MIN_DETECTION_SCORE
+        faces = await run_inference_with_timeout("detect-with-distance", face_app.get, img)
+        results: List[Dict[str, Any]] = []
+
+        # Parse camera params
+        try:
+            camera_roi_polygon = json.loads(roi_polygon) if roi_polygon else None
+        except (json.JSONDecodeError, TypeError):
+            camera_roi_polygon = None
+
+        distance_ignore = distance_ignore_m or 1.5
+        distance_min = distance_min_m or 2.0
+        distance_max = distance_max_m or 4.0
+
+        for face in faces[:max_faces]:
+            if not passes_quality_gate(face):
+                continue
+
+            box = face.bbox.astype(int).tolist()
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            cx = (x1 + x2) / 2.0
+
+            detection: Dict[str, Any] = {
+                "box": {
+                    "x": box[0],
+                    "y": box[1],
+                    "width": box[2] - box[0],
+                    "height": box[3] - box[1],
+                },
+                "score": float(face.det_score),
+            }
+            if with_descriptors and hasattr(face, "embedding") and face.embedding is not None:
+                detection["descriptor"] = face.embedding.tolist()
+
+            # Distance estimation ladder
+            if distance_calib_mode or True:  # always try
+                try:
+                    # ROI polygon filter
+                    if camera_roi_polygon and not bbox_in_roi_polygon(box, width, height, camera_roi_polygon):
+                        continue  # skip faces outside ROI polygon (shadows/glare)
+
+                    depth, used = estimate_depth_m({
+                        "mode": distance_calib_mode,
+                        "bbox": box,
+                        "frame_w": width,
+                        "frame_h": height,
+                        "feet_px": (cx, y2),
+                        "feet_y_px": y2,
+                        "height_px": (y2 - y1) * 3.0,
+                        "homography": None,  # TODO: pass from client
+                        "person_calib": None,  # TODO: pass from client
+                        "focal_px": float(focal_length_px) if focal_length_px else None,
+                    })
+
+                    detection["distance_m"] = depth
+                    detection["depth_mode"] = used
+
+                    in_zone = False
+                    if depth is not None:
+                        if depth >= distance_ignore:
+                            in_zone = distance_min <= depth <= distance_max
+                    detection["in_zone"] = in_zone
+                except Exception:
+                    detection["distance_m"] = None
+                    detection["depth_mode"] = "error"
+                    detection["in_zone"] = False
+
+            results.append(detection)
+
+        return {"faces": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Detection-with-distance error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

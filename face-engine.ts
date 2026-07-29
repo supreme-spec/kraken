@@ -1672,3 +1672,73 @@ export async function forceHealthCheck(): Promise<boolean> {
   pythonServerLastCheck = 0; // сбрасываем таймер
   return await checkPythonServerHealth();
 }
+
+// ── v2: детекция с distance (Python /detect-with-distance) ──
+export interface DetectedFaceWithDistance extends DetectedFace {
+  distance_m?: number | null;
+  depth_mode?: string;
+  in_zone?: boolean;
+  track_id?: number;
+  dwell_time_sec?: number;
+  is_stopped?: boolean;
+}
+
+export async function detectFacesWithDistance(
+  imgBuffer: Buffer,
+  cam: any
+): Promise<DetectedFaceWithDistance[]> {
+  try {
+    const formData = new FormData();
+    const uint8Array = new Uint8Array(imgBuffer);
+    const blob = new Blob([uint8Array], { type: "image/jpeg" });
+    formData.append("image", blob as any, "image.jpg");
+    formData.append("with_descriptors", "true");
+
+    // Отправляем параметры камеры для distance-расчётов
+    if (cam.distance_calib_mode) formData.append("distance_calib_mode", cam.distance_calib_mode);
+    if (cam.roi_zones) formData.append("roi_polygon", cam.roi_zones);
+    if (cam.distance_min_m) formData.append("distance_min_m", String(cam.distance_min_m));
+    if (cam.distance_max_m) formData.append("distance_max_m", String(cam.distance_max_m));
+    if (cam.distance_ignore_m) formData.append("distance_ignore_m", String(cam.distance_ignore_m));
+    if (cam.focal_length_px) formData.append("focal_length_px", String(cam.focal_length_px));
+
+    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/detect-with-distance`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      if (response.status === 400) {
+        logDebug(`Детекция с distance: кадр пустой (400), пропуск`);
+        return [];
+      }
+      if (response.status >= 500) {
+        logError(new Error(`Server responded with status: ${response.status}`), { context: "Детекция с distance" });
+      }
+      throw new Error(`Server responded with status: ${response.status}`);
+    }
+
+    const result = await response.json() as {
+      faces: Array<{
+        box: any;
+        score: number;
+        descriptor?: number[];
+        distance_m?: number | null;
+        depth_mode?: string;
+        in_zone?: boolean;
+      }>;
+    };
+
+    return result.faces.map((f: any) => ({
+      box: f.box,
+      score: f.score,
+      descriptor: f.descriptor ? new Float32Array(f.descriptor) : undefined,
+      distance_m: f.distance_m ?? null,
+      depth_mode: f.depth_mode,
+      in_zone: f.in_zone,
+    }));
+  } catch (e) {
+    logError(e as Error, { context: "Детекция с distance" });
+    return [];
+  }
+}

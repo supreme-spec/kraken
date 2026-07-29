@@ -30,6 +30,7 @@ import {
   initFaceEngine,
   initFaceEngineWithDB,
   detectFaces,
+  detectFacesWithDistance,
   detectFacesFast,
   getEmbedding,
   extractEmbedding,
@@ -4070,7 +4071,7 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
     detectionInProgress = true;
     try {
       const buf = Buffer.from(frameBase64, "base64");
-      const faces = await detectFaces(buf);
+      const faces = await detectFacesWithDistance(buf, cam);
 
       // v2: proxy-метрики со ВСЕХ лиц — fire-and-forget (сырьё для AI Quality)
       for (const f of faces as any[]) {
