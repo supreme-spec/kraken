@@ -1,0 +1,32 @@
+# ВСТАВИТЬ в face_server.py:
+
+# 1. Импорт (в начало файла, рядом с другими imports):
+# from distance import estimate_depth_m, bbox_in_roi_polygon, build_homography, build_person_calib
+
+# 2. В цикле по лицам (вместо / внутри цикла for face in faces):
+#     if not bbox_in_roi_polygon(face.bbox, width, height, camera_roi_polygon):
+#         continue
+#     depth, used = estimate_depth_m({
+#         "mode": camera_distance_calib_mode,
+#         "bbox": face.bbox,
+#         "frame_w": width,
+#         "frame_h": height,
+#         "feet_px": (cx, y2),
+#         "feet_y_px": y2,
+#         "height_px": (y2 - y1) * 3.0,
+#         "homography": camera_floor_homography,
+#         "person_calib": camera_person_calib,
+#         "focal_px": camera_focal_length_px
+#     })
+#     detection["distance_m"] = depth
+#     detection["depth_mode"] = used
+#     detection["in_zone"] = is_in_distance_zone(depth) if depth else False
+
+# 3. Endpoint'ы калибровки (в конец файла, рядом с другими @app.post):
+# @app.post("/calib/homography", dependencies=[Depends(verify_api_key)])
+# async def calib_homography(p: dict):
+#     return {"homography": build_homography(p["pts_px"], p["pts_m"])}
+#
+# @app.post("/calib/person2", dependencies=[Depends(verify_api_key)])
+# async def calib_person2(p: dict):
+#     return {"person_calib": build_person_calib(p["pts_px"], p["depths_m"])}

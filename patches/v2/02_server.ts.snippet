@@ -1,0 +1,37 @@
+// ВСТАВИТЬ ВНУТРЬ startCameraDetection(cam, fallbackFrame).
+// useSub=false → падает в старый single-stream код.
+//
+// ── Начало вставки: dual-stream с субпотоком ──
+const useSub = !!cam.stream_sub_url && cam.use_substream_tracking !== false;
+if (useSub) {
+    const subBuf = await grabFrameFrom(cam.stream_sub_url);
+    const facesSub = await detectFacesWithDistance(subBuf, cam);
+    const tracked = subTracker.update(facesSub);
+    const stopped = tracked.filter(t =>
+        t.is_stopped &&
+        t.dwell_time_sec >= (cam.dwell_time_sec ?? 15) &&
+        t.distance_m != null &&
+        isInRange(t.distance_m, cam) &&
+        !t.recognized
+    );
+    if (stopped.length) {
+        const mainBuf = await grabFrameFrom(cam.stream_main_url || cam.url);
+        const enriched = await processTrackedFaces(cam, mainBuf.toString("base64"), stopped);
+        stopped.forEach((t, i) => {
+            t.recognized = true;
+            t.person_id = enriched[i]?.person_id;
+        });
+    }
+    const cur = cameraFrames.get(cam.id) || { frame: fallbackFrame, faces: [] };
+    cur.faces = tracked;
+    cameraFrames.set(cam.id, cur);
+    for (const t of tracked) {
+        recordProxyStat(cam.id, {
+            face_px: faceWidthPx(t.bbox),
+            candidate: t.is_stopped
+        }).catch(() => {});
+    }
+    return;
+}
+// ── Конец вставки ──
+// ...ниже — без изменений старый single-stream код...

@@ -42,8 +42,53 @@ model Camera {
   passage_roi_y_max    Float?    @default(0.8)
   guard_ignore_x_max   Float?    @default(0.3)
 
+  // ── v2: профилирование потока (ffprobe, read-only) ──
+  detected_width        Int?
+  detected_height       Int?
+  detected_fps          Float?
+  detected_codec        String?
+  detected_bitrate_kbps Int?
+  detected_gop          Int?
+  detected_at           DateTime?
+  profile_version       Int       @default(1)
+  profile_needs_refresh Boolean   @default(false)
+  // ── v2: override потока (Advanced) ──
+  override_width        Int?
+  override_height       Int?
+  override_fps          Float?
+  // ── v2: два потока ──
+  stream_main_url       String?
+  stream_sub_url        String?
+  use_substream_tracking Boolean  @default(true)
+  // ── v2: декод (на камере только аварийный override) ──
+  force_decode_strategy String?
+  detection_max_width   Int       @default(960)
+  // ── v2: ROI полигон ──
+  roi_polygon           String?
+  // ── v2: калибровка расстояния лесенкой ──
+  distance_calib_mode   String?
+  person_calib_pts_px   String?
+  person_calib_depth_m  String?
+  floor_calib_pts_px    String?
+  floor_calib_pts_m     String?
+  floor_homography      String?
+  // ── v2: рекомендации + сырьё для score ──
+  stream_recommendation String?
+  ai_proxy_stats        String?
+  feedback_counts       String?
+
   events               Event[]
   recordings           Recording[]
+}
+
+model SystemConfig {
+  id                     String   @id @default("default")
+  server_decode_strategy String   @default("auto")
+  server_has_gpu         Boolean  @default(false)
+  server_hw_min_cameras  Int      @default(4)
+  server_hw_min_pixels   Int      @default(8294400)
+  health_rules_version   String   @default("v3")
+  updated_at             DateTime @updatedAt
 }
 
 model Category {

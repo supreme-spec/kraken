@@ -1,0 +1,39 @@
+// ADD to model Camera (в конец блока, ПЕРЕД следующей model)
+detected_width        Int?
+detected_height       Int?
+detected_fps          Float?
+detected_codec        String?
+detected_bitrate_kbps Int?
+detected_gop          Int?
+detected_at           DateTime?
+profile_version       Int       @default(1)
+profile_needs_refresh Boolean   @default(false)
+override_width        Int?
+override_height       Int?
+override_fps          Float?
+stream_main_url       String?
+stream_sub_url        String?
+use_substream_tracking Boolean  @default(true)
+force_decode_strategy String?
+detection_max_width   Int       @default(960)
+roi_polygon           Json?
+distance_calib_mode   String?
+person_calib_pts_px   Json?
+person_calib_depth_m  Json?
+floor_calib_pts_px    Json?
+floor_calib_pts_m     Json?
+floor_homography      Json?
+stream_recommendation Json?
+ai_proxy_stats        Json?
+feedback_counts       Json?
+
+// Новая модель
+model SystemConfig {
+    id                     String   @id @default("default")
+    server_decode_strategy String   @default("auto")
+    server_has_gpu         Boolean  @default(false)
+    server_hw_min_cameras  Int      @default(4)
+    server_hw_min_pixels   Int      @default(8294400)
+    health_rules_version   String   @default("v3")
+    updated_at             DateTime @updatedAt
+}
