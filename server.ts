@@ -4055,6 +4055,10 @@ function startCameraPipeline(cam: any, fallbackFrame: string, transportOverride?
 function startCameraDetection(cam: any, fallbackFrame: string) {
   if (cameraDetectionTimers.has(cam.id)) return;
   let detectionInProgress = false;
+  // v2: Set обработанных bbox-ключей — защита от повторного инференса одного и того же лица
+  const processedKeys = new Set<string>();
+  // fallback-ключ: если трекер не проставил track_id, используем центр bbox (грубее, но работает)
+  const keyOf = (f: any) => f.track_id != null ? String(f.track_id) : `b${Math.round((f.bbox[0] + f.bbox[2]) / 20)}_${Math.round((f.bbox[1] + f.bbox[3]) / 20)}`;
 
   const timer = setInterval(async () => {
     if (!activeFfmpegProcesses.has(cam.id)) return;
@@ -4076,15 +4080,23 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
         }).catch(() => {});
       }
 
-      // v2: в распознавание — ТОЛЬКО кандидаты: остановился + dwell >= 15с + зона 2-4м + не распознан
+      // v2: чистим Set от лиц, ушедших из кадра
+      const liveKeys = new Set((faces as any[]).map(f => keyOf(f)));
+      for (const k of processedKeys) { if (!liveKeys.has(k)) processedKeys.delete(k); }
+
+      // v2: в распознавание — ТОЛЬКО кандидаты: остановился + dwell >= 15с + зона 2-4м + ещё не обработан
       const candidates = (faces as any[]).filter((f) =>
         f.is_stopped &&
         (f.dwell_time_sec ?? 0) >= (cam.dwell_time_sec ?? 15) &&
         isInRange(f.distance_m, cam) &&
-        !f.recognized
+        !processedKeys.has(keyOf(f))
       );
 
       const enriched = await processDetectedFaces(cam, frameBase64, candidates);
+
+      // v2: помечаем кандидатов как обработанных (независимо от результата распознавания)
+      for (const f of candidates) processedKeys.add(keyOf(f));
+
       const cur = cameraFrames.get(cam.id) || { frame: frameBase64, faces: [] };
       cur.faces = enriched;
       cameraFrames.set(cam.id, cur);
