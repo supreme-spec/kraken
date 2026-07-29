@@ -47,6 +47,8 @@ import {
 } from "./face-engine.js";
 import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
+import { recordProxyStat } from "./src/lib/ai-quality.js";
+import { isInRange, faceWidthPx } from "./src/lib/detection-helpers.js";
 
 // ── __filename / __dirname ────────────────────────────────────────────────────
 // tsx запускает файл как ESM-модуль → используем import.meta.url напрямую.
@@ -4065,7 +4067,24 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
     try {
       const buf = Buffer.from(frameBase64, "base64");
       const faces = await detectFaces(buf);
-      const enriched = await processDetectedFaces(cam, frameBase64, faces);
+
+      // v2: proxy-метрики со ВСЕХ лиц — fire-and-forget (сырьё для AI Quality)
+      for (const f of faces as any[]) {
+        recordProxyStat(cam.id, {
+          face_px: faceWidthPx(f.bbox),
+          candidate: !!f.is_stopped,
+        }).catch(() => {});
+      }
+
+      // v2: в распознавание — ТОЛЬКО кандидаты: остановился + dwell >= 15с + зона 2-4м + не распознан
+      const candidates = (faces as any[]).filter((f) =>
+        f.is_stopped &&
+        (f.dwell_time_sec ?? 0) >= (cam.dwell_time_sec ?? 15) &&
+        isInRange(f.distance_m, cam) &&
+        !f.recognized
+      );
+
+      const enriched = await processDetectedFaces(cam, frameBase64, candidates);
       const cur = cameraFrames.get(cam.id) || { frame: frameBase64, faces: [] };
       cur.faces = enriched;
       cameraFrames.set(cam.id, cur);
